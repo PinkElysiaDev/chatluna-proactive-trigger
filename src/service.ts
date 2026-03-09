@@ -358,15 +358,12 @@ export class ProactiveChatService extends Service {
         if (!msgs.length) return { txt: '', imgs: [] }
 
         const imgs: string[] = []
-        let n = 0
 
         const lines = msgs.map((m) => {
-            const marks = (m.imgs ?? []).map((u) => {
-                imgs.push(u)
-                n += 1
-                return `[图片${n}]`
-            }).join(' ')
-            const t = [m.content, marks].filter(Boolean).join(' ').trim()
+            if (m.imgs?.length) {
+                imgs.push(...m.imgs)
+            }
+            const t = (m.content || '').trim()
             return `[${this._formatTimestamp(m.timestamp)}] ${m.name}(${m.id}): ${t}`
         })
 
@@ -438,7 +435,7 @@ export class ProactiveChatService extends Service {
         const msg: ChatMessage = {
             id: session.author?.id || session.userId,
             name: session.author?.name || session.author?.nick || session.username || 'Unknown',
-            content: session.content || '',
+            content: this._normalizeMessageContent(session.content || '', imgs.length),
             timestamp: session.timestamp || Date.now(),
             ...(imgs.length ? { imgs } : {})
         }
@@ -465,6 +462,23 @@ export class ProactiveChatService extends Service {
         }
 
         return out
+    }
+
+    private _normalizeMessageContent(raw: string, imageCount: number): string {
+        let text = String(raw ?? '')
+
+        // 清理常见图片片段，避免将长 URL 写入历史文本
+        text = text
+            .replace(/\[CQ:image,[^\]]*]/gi, '')
+            .replace(/!\[[^\]]*]\((https?:\/\/[^)\s]+)\)/gi, '')
+            .replace(/https?:\/\/\S+\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\?\S*)?/gi, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+
+        if (imageCount <= 0) return text
+
+        const marks = Array.from({ length: imageCount }, (_, i) => `[图片:${i + 1}]`).join(' ')
+        return [text, marks].filter(Boolean).join(' ').trim()
     }
 
     private _getRecentHistory(conversationId: string): string {
@@ -588,15 +602,19 @@ export class ProactiveChatService extends Service {
             if (!Array.isArray(messages)) continue
             result[conversationId] = messages
                 .filter(msg => msg && typeof msg === 'object')
-                .map(msg => ({
-                    id: String(msg.id ?? ''),
-                    name: String(msg.name ?? 'Unknown'),
-                    content: String(msg.content ?? ''),
-                    timestamp: Number(msg.timestamp) || Date.now(),
-                    imgs: Array.isArray(msg.imgs)
+                .map(msg => {
+                    const imgs = Array.isArray(msg.imgs)
                         ? msg.imgs.map((u) => String(u)).filter(Boolean)
                         : []
-                }))
+
+                    return {
+                        id: String(msg.id ?? ''),
+                        name: String(msg.name ?? 'Unknown'),
+                        content: this._normalizeMessageContent(String(msg.content ?? ''), imgs.length),
+                        timestamp: Number(msg.timestamp) || Date.now(),
+                        imgs
+                    }
+                })
                 .slice(-Math.max(1, this._config.historyBufferSize || this.MAX_MESSAGES))
         }
         return result

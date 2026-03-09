@@ -5,15 +5,12 @@ import { Config } from './config'
 export const name = 'chatluna-proactive-trigger'
 
 export const usage = `
-为 chatluna 提供“主动发言”能力：在群聊活跃或长时间空闲时自动发言。
-
-关键参数配置方法（建议按顺序调）：
+关键参数解析及配置方法：
 
 1) 应用范围
 - applyGroup / applyPrivateUsers：只在列出的群或私聊生效；留空即该类型不触发。
 
-2) 活跃度触发（主触发）
-- enableActivityTrigger：开启后按群聊活跃分数触发。
+2) 活跃度触发
 - activityThreshold.lowerLimit / upperLimit：
   - lower = upper：固定灵敏度；
   - lower < upper：越聊越不容易触发（更克制）；
@@ -32,6 +29,9 @@ export const usage = `
 - historyBufferSize：每个会话缓存上限（影响可注入历史池大小）。
 - syncToAllRooms：将主动发言同步到同群其他用户 room 历史（每用户独立 room 时建议开启）。
 - verboseLog：排障时开启，可输出完整请求快照。
+
+0.1.2 版本更新内容：
+-优化图片 url 为占位符，节省 input token 。
 `
 
 export const inject = {
