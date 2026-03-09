@@ -1,0 +1,20 @@
+applyGroup: "List of group IDs to apply"
+applyPrivateUsers: "List of private user IDs to apply"
+
+enableActivityTrigger: "Enable activity trigger"
+activityThreshold:
+  lowerLimit: "Activity threshold lower limit"
+  upperLimit: "Activity threshold upper limit"
+messageInterval: "Message count trigger interval"
+
+enableIdleTrigger: "Enable idle trigger"
+idleTrigger:
+  intervalMinutes: "Idle trigger interval (minutes)"
+  enableJitter: "Enable random jitter"
+
+includeChatHistory: "Include recent chat history in proactive messages"
+maxHistoryMessages: "Maximum number of history messages to include"
+historyBufferSize: "Maximum cached history messages per conversation (for future trigger injection)"
+cooldownSeconds: "Cooldown time after trigger (seconds)"
+syncToAllRooms: "After proactive reply, sync conversation records to all users' room histories in the same group (only effective in per-user room mode)"
+verboseLog: "Verbose log mode: print full proactive trigger request payload"

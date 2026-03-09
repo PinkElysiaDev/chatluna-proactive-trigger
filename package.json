@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-chatluna-proactive-trigger",
-  "description": "Automatically trigger chatluna bot as how plugin-character do",
-  "version": "0.0.1",
+  "description": "Automatically trigger chatluna bot with activity-based and idle triggers",
+  "version": "0.1.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -9,14 +9,35 @@
     "dist"
   ],
   "license": "MIT",
-  "scripts": {},
+  "homepage": "https://github.com/PinkElysiaDev/chatluna-proactive-trigger#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PinkElysiaDev/chatluna-proactive-trigger.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PinkElysiaDev/chatluna-proactive-trigger/issues"
+  },
   "keywords": [
     "chatbot",
     "koishi",
-    "plugin"
+    "plugin",
+    "chatluna"
   ],
-  "devDependencies": {},
   "peerDependencies": {
-    "koishi": "^4.18.7"
+    "@langchain/core": "^0.3.0",
+    "koishi": "^4.18.7",
+    "koishi-plugin-chatluna": "^1.0.0"
+  },
+  "koishi": {
+    "description": {
+      "zh": "为 chatluna 主插件提供主动发言能力的扩展插件，支持空闲触发及活跃度触发",
+      "en": "An extension plugin for chatluna that provides proactive speaking capabilities, supporting both idle and activity-based triggers"
+    }
+  },
+  "devDependencies": {
+    "@langchain/core": "^0.3.80",
+    "@types/node": "^22.0.0",
+    "koishi": "^4.18.7",
+    "koishi-plugin-chatluna": "^1.0.0"
   }
 }
