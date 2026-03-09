@@ -56,10 +56,10 @@ export const Config: Schema<Config> = Schema.intersect([
         activityThreshold: Schema.object({
             lowerLimit: Schema.number().min(0).max(1).step(0.05)
                 .default(0.85)
-                .description('活跃度阈值下限'),
+                .description('初始触发灵敏度'),
             upperLimit: Schema.number().min(0).max(1).step(0.05)
                 .default(0.85)
-                .description('活跃度阈值上限'),
+                .description('灵敏度趋向值'),
         }).description('活跃度阈值配置'),
         messageInterval: Schema.number().min(0).max(100)
             .default(20)

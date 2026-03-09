@@ -3,8 +3,8 @@ applyPrivateUsers: "List of private user IDs to apply"
 
 enableActivityTrigger: "Enable activity trigger"
 activityThreshold:
-  lowerLimit: "Activity threshold lower limit"
-  upperLimit: "Activity threshold upper limit"
+  lowerLimit: "Initial trigger sensitivity"
+  upperLimit: "Sensitivity target value"
 messageInterval: "Message count trigger interval"
 
 enableIdleTrigger: "Enable idle trigger"

@@ -3,8 +3,8 @@ applyPrivateUsers: "应用到的私聊用户 ID 列表"
 
 enableActivityTrigger: "启用活跃度触发"
 activityThreshold:
-  lowerLimit: "活跃度阈值下限"
-  upperLimit: "活跃度阈值上限"
+  lowerLimit: "初始触发灵敏度"
+  upperLimit: "灵敏度趋向值"
 messageInterval: "消息计数触发间隔"
 
 enableIdleTrigger: "启用空闲触发"
