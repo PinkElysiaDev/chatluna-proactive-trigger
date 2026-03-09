@@ -1,5 +1,4 @@
 import { Context, Service, Session, Logger, Next, h } from 'koishi'
-import { HumanMessage, AIMessage } from '@langchain/core/messages'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { Config } from './config'
@@ -299,7 +298,7 @@ export class ProactiveChatService extends Service {
     private async _syncToAllGroupRooms(
         guildId: string,
         excludeConversationId: string,
-        aiMessage: AIMessage
+        aiMessage: any
     ): Promise<void> {
         // 查找群内所有用户当前绑定的 room
         const userRecords = await this.ctx.database.get('chathub_user', { groupId: guildId })
@@ -313,14 +312,11 @@ export class ProactiveChatService extends Service {
 
         this._logger.debug(`Syncing proactive message to ${otherRooms.length} other rooms in guild ${guildId}`)
 
-        const humanMsg = new HumanMessage('[主动发言触发]')
-
         for (const room of otherRooms) {
             try {
                 const history = new KoishiChatMessageHistory(this.ctx, room.conversationId, 10000)
                 await history.loadConversation()
-                await history.addMessage(humanMsg)
-                await history.addMessage(aiMessage)
+                await history.addMessage(aiMessage as any)
             } catch (e) {
                 this._logger.warn(`Failed to sync to room ${room.roomId} (${room.conversationId}): ${e}`)
             }

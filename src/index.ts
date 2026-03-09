@@ -30,8 +30,9 @@ export const usage = `
 - syncToAllRooms：将主动发言同步到同群其他用户 room 历史（每用户独立 room 时建议开启）。
 - verboseLog：排障时开启，可输出完整请求快照。
 
-0.1.3 版本更新内容：
+0.1.3 & 0.1.4 版本更新内容：
 - 修复图片文件上传方式，确保图片可以正确发送给大模型 。
+- 移除了错误的依赖项，以保证兼容性。
 `
 
 export const inject = {
