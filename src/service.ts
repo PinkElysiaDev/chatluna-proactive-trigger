@@ -221,14 +221,10 @@ export class ProactiveChatService extends Service {
             const msgs = useHist ? this._getRecentHistoryMessages(conversationId) : []
             const { txt: histTxt, imgs } = this._fmtHist(msgs)
             const bodyTxt = this._buildReqText(trigger.reason, histTxt)
-            const content = this._buildReqContent(bodyTxt, imgs)
-            const requestPayload = {
-                inputMessage: {
-                    content,
-                    additional_kwargs: {
-                        is_proactive: true
-                    }
-                }
+            const proactiveElements = this._mkEls(bodyTxt, imgs)
+            const commandOptions = {
+                message: proactiveElements,
+                is_proactive: true
             }
 
             this._logger.info(`Triggering proactive response for ${conversationId}: ${trigger.reason}`)
@@ -237,7 +233,7 @@ export class ProactiveChatService extends Service {
                 const verboseSnapshot = {
                     triggerType: trigger.type,
                     triggerReason: trigger.reason,
-                    command: 'chat',
+                    command: '',
                     session: {
                         platform: session.platform,
                         selfId: session.selfId,
@@ -259,7 +255,10 @@ export class ProactiveChatService extends Service {
                         injectedImageCount: imgs.length,
                         injectedImages: imgs
                     },
-                    requestPayload
+                    commandOptions: {
+                        is_proactive: true,
+                        messagePreview: proactiveElements.map((el) => el?.toString?.(true) ?? String(el))
+                    }
                 }
 
                 this._logger.info(
@@ -267,21 +266,11 @@ export class ProactiveChatService extends Service {
                 )
             }
 
-            const oldContent = session.content
-            const oldElements = session.elements
-            ;(session as any).content = bodyTxt
-            ;(session as any).elements = this._mkEls(bodyTxt, imgs)
-
-            try {
-                await this.ctx.chatluna.chatChain.receiveCommand(
-                    session,
-                    'chat',
-                    requestPayload
-                )
-            } finally {
-                ;(session as any).content = oldContent
-                ;(session as any).elements = oldElements
-            }
+            await this.ctx.chatluna.chatChain.receiveCommand(
+                session,
+                '',
+                commandOptions
+            )
 
             if (useHist) {
                 this._chatMessages[conversationId] = []
@@ -358,16 +347,48 @@ export class ProactiveChatService extends Service {
         if (!msgs.length) return { txt: '', imgs: [] }
 
         const imgs: string[] = []
+        let globalImageIndex = 0
 
         const lines = msgs.map((m) => {
-            if (m.imgs?.length) {
-                imgs.push(...m.imgs)
+            const imageCount = m.imgs?.length ?? 0
+            if (imageCount > 0) {
+                imgs.push(...m.imgs!)
             }
-            const t = (m.content || '').trim()
+
+            const t = this._renumberImageMarks(
+                (m.content || '').trim(),
+                imageCount,
+                () => ++globalImageIndex
+            )
+
             return `[${this._formatTimestamp(m.timestamp)}] ${m.name}(${m.id}): ${t}`
         })
 
         return { txt: lines.join('\n'), imgs }
+    }
+
+    private _renumberImageMarks(
+        content: string,
+        imageCount: number,
+        nextIndex: () => number
+    ): string {
+        if (imageCount <= 0) return content
+
+        let replaced = 0
+        const text = content.replace(/\[图片:\d+]/g, () => {
+            if (replaced >= imageCount) return ''
+            replaced += 1
+            return `[图片:${nextIndex()}]`
+        })
+
+        if (replaced >= imageCount) return text.trim()
+
+        const remainMarks: string[] = []
+        for (let i = replaced; i < imageCount; i++) {
+            remainMarks.push(`[图片:${nextIndex()}]`)
+        }
+
+        return [text.trim(), ...remainMarks].filter(Boolean).join(' ').trim()
     }
 
     private _mkEls(txt: string, imgs: string[]) {
@@ -470,8 +491,10 @@ export class ProactiveChatService extends Service {
         // 清理常见图片片段，避免将长 URL 写入历史文本
         text = text
             .replace(/\[CQ:image,[^\]]*]/gi, '')
+            .replace(/<img\b[^>]*\/?>/gi, '')
             .replace(/!\[[^\]]*]\((https?:\/\/[^)\s]+)\)/gi, '')
             .replace(/https?:\/\/\S+\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\?\S*)?/gi, '')
+            .replace(/https?:\/\/\S*\/download\?[^\s"'<>]+/gi, '')
             .replace(/\s+/g, ' ')
             .trim()
 
