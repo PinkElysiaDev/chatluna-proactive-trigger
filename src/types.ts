@@ -75,6 +75,7 @@ export interface IdleTriggerConfig {
  */
 export interface IdleTriggerResult {
     reason: string
+    silenceMinutes?: number
 }
 
 /**
@@ -88,4 +89,5 @@ export type TriggerType = 'activity' | 'idle'
 export interface TriggerReason {
     type: TriggerType
     reason: string
+    idleMinutes?: number
 }

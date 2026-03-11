@@ -45,45 +45,43 @@ npm install koishi-plugin-chatluna-proactive-trigger
 
 ## 配置项总览
 
-### 应用范围
+### 基础配置
 
 | 配置项 | 说明 |
 |--------|------|
-| `applyGroup` | 应用到的群组 ID 列表（为空则不触发群聊） |
-| `applyPrivateUsers` | 应用到的私聊用户 ID 列表（为空则不触发私聊） |
+| `applyDefaultGroupConfigs` | 应用默认配置的群号列表：列表中的群组将使用默认群聊配置模板 |
+| `applyDefaultPrivateConfigs` | 应用默认配置的私聊用户列表：列表中的用户将使用默认私聊配置模板 |
+| `syncToAllRooms` | 主动发言后，将对话记录同步写入该群所有用户的对话历史（仅在每用户独立 room 模式下有效） |
+| `verboseLog` | 详细日志模式：打印完整的触发请求内容 |
 
-### 活跃度触发
+### 群聊配置
 
 | 配置项 | 说明 |
 |--------|------|
+| `guildId` | 群号（必填，填写 `"default"` 作为默认群聊配置模板） |
 | `enableActivityTrigger` | 是否启用活跃度触发 |
-| `activityThreshold.lowerLimit` | 活跃度阈值下限（0~1） |
-| `activityThreshold.upperLimit` | 活跃度阈值上限（0~1） |
-| `messageInterval` | 消息计数兜底触发间隔（0 表示关闭） |
-
-### 空闲触发
-
-| 配置项 | 说明 |
-|--------|------|
+| `activityLowerLimit` | 初始触发灵敏度（0~1） |
+| `activityUpperLimit` | 灵敏度趋向值（0~1） |
+| `activityMessageInterval` | 消息计数触发间隔 |
+| `activityPromptTemplate` | 活跃触发提示词模板 |
 | `enableIdleTrigger` | 是否启用空闲触发 |
-| `idleTrigger.intervalMinutes` | 空闲触发间隔（分钟） |
-| `idleTrigger.enableJitter` | 是否启用随机抖动 |
+| `idleIntervalMinutes` | 空闲触发间隔（分钟） |
+| `idleEnableJitter` | 是否启用随机抖动 |
+| `idlePromptTemplate` | 空闲触发提示词模板 |
+| `historyMessageLimit` | 历史消息条数上限 |
+| `cooldownSeconds` | 触发后冷却时间（秒） |
 
-### 历史与频率控制
-
-| 配置项 | 说明 |
-|--------|------|
-| `includeChatHistory` | 是否在主动发言时注入近期群聊历史 |
-| `maxHistoryMessages` | 单次触发最多注入的历史消息条数 |
-| `historyBufferSize` | 每个会话的历史缓存上限（历史池容量） |
-| `cooldownSeconds` | 两次触发之间的冷却时间（秒） |
-
-### 同步与调试
+### 私聊配置
 
 | 配置项 | 说明 |
 |--------|------|
-| `syncToAllRooms` | 主动发言后是否同步到同群其他用户 room 历史（仅每用户独立 room 模式下有效） |
-| `verboseLog` | 是否打印完整触发请求日志 |
+| `userId` | 私聊用户 ID（必填，填写 `"default"` 作为默认私聊配置模板） |
+| `enableIdleTrigger` | 是否启用空闲触发 |
+| `idleIntervalMinutes` | 空闲触发间隔（分钟） |
+| `idleEnableJitter` | 是否启用随机抖动 |
+| `idlePromptTemplate` | 空闲触发提示词模板 |
+| `historyMessageLimit` | 历史消息条数上限 |
+| `cooldownSeconds` | 触发后冷却时间（秒） |
 
 ## 关键参数配置方法（简练版）
 

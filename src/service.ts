@@ -1,7 +1,7 @@
 import { Context, Service, Session, Logger, Next, h } from 'koishi'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import { Config } from './config'
+import { Config, GroupTriggerConfig, TriggerProfileConfig, PrivateTriggerConfig } from './config'
 import { ActivityScorer } from './activity'
 import { IdleScheduler } from './scheduler'
 import { ChatMessage, ConversationState, TriggerReason } from './types'
@@ -47,12 +47,11 @@ export class ProactiveChatService extends Service {
 
     constructor(ctx: Context, private _config: Config) {
         super(ctx, 'chatluna_proactive')
-        this._activityScorer = new ActivityScorer(_config)
-        this._idleScheduler = new IdleScheduler(_config)
+        this._activityScorer = new ActivityScorer()
+        this._idleScheduler = new IdleScheduler()
         this._logger = ctx.logger('chatluna-proactive')
         this._stateFilePath = path.resolve(ctx.baseDir || process.cwd(), 'data', 'chatluna-proactive-trigger-state.json')
 
-        // 监听 chatluna 对话完成事件，将结果同步到群内其他 room
         ctx.on('chatluna/after-chat', async (conversationId, _sourceMessage, responseMessage) => {
             const guildId = this._pendingBroadcast.get(conversationId)
             if (!guildId) return
@@ -66,13 +65,10 @@ export class ProactiveChatService extends Service {
 
     async start(): Promise<void> {
         await this._loadState()
-        // 注册消息收集中间件
         this.ctx.middleware((session, next) => this.handleMessage(session, next))
-        // 启动空闲触发调度器
         this._schedulerDisposable = this.ctx.setInterval(() => {
             this._processSchedulerTick()
         }, 1000)
-        // 定期落盘，避免重启丢失状态
         this._persistenceDisposable = this.ctx.setInterval(() => {
             this._saveState()
         }, 10000)
@@ -94,7 +90,9 @@ export class ProactiveChatService extends Service {
 
     async handleMessage(session: Session, next: Next): Promise<void> {
         if (this.ctx.bots[session.uid]) { await next(); return }
-        if (!this._isApplicable(session)) {
+
+        const profile = this._getProfileBySession(session)
+        if (!profile) {
             this._logger.debug(`[handleMessage] session not applicable: uid=${session.uid} guildId=${session.guildId} isDirect=${session.isDirect}`)
             await next(); return
         }
@@ -105,20 +103,20 @@ export class ProactiveChatService extends Service {
         const now = session.timestamp || Date.now()
         this._recordTimestamp(conversationId, now)
 
-        if (!session.isDirect && this._config.includeChatHistory) {
+        if (!session.isDirect) {
             this._addChatMessage(conversationId, session)
         }
 
-        const state = this._getOrCreateState(conversationId)
+        const state = this._getOrCreateState(conversationId, profile)
         state.lastMessageTime = now
         state.messageCount = (state.messageCount ?? 0) + 1
         this._markDirty()
 
         this._logger.debug(`[handleMessage] conversationId=${conversationId} messageCount=${state.messageCount} lastActivityScore=${state.lastActivityScore?.toFixed(3)} threshold=${state.currentThreshold?.toFixed(3)}`)
 
-        const triggerReason = this._evaluateTriggers(conversationId, state, now)
+        const triggerReason = this._evaluateTriggers(conversationId, state, now, profile)
         if (triggerReason) {
-            await this._triggerResponse(session, triggerReason)
+            await this._triggerResponse(session, triggerReason, profile)
             return
         }
 
@@ -132,7 +130,13 @@ export class ProactiveChatService extends Service {
             const session = this._sessions[conversationId]
             if (!session) continue
 
-            const cooldownRemaining = state.lastTriggerTime ? this._config.cooldownSeconds * 1000 - (now - state.lastTriggerTime) : 0
+            const profile = this._getProfileByConversationId(conversationId)
+            if (!profile) continue
+
+            const cooldownRemaining = state.lastTriggerTime
+                ? profile.cooldownSeconds * 1000 - (now - state.lastTriggerTime)
+                : 0
+
             if (cooldownRemaining > 0) {
                 this._logger.debug(`[schedulerTick] ${conversationId}: in cooldown, ${Math.ceil(cooldownRemaining / 1000)}s remaining`)
                 continue
@@ -142,21 +146,30 @@ export class ProactiveChatService extends Service {
                 continue
             }
 
-            const idleTrigger = this._idleScheduler.shouldTrigger(state, now)
+            const idleTrigger = this._idleScheduler.shouldTrigger(state, now, profile)
             if (idleTrigger) {
                 this._logger.debug(`Idle trigger for ${conversationId}: ${idleTrigger.reason}`)
-                await this._triggerResponse(session, { type: 'idle', reason: idleTrigger.reason })
+                await this._triggerResponse(session, {
+                    type: 'idle',
+                    reason: idleTrigger.reason,
+                    idleMinutes: idleTrigger.silenceMinutes ?? 0
+                }, profile)
                 this._markDirty()
-            } else if (state.lastMessageTime) {
+            } else if (state.lastMessageTime && profile.enableIdleTrigger) {
                 const idleMs = now - state.lastMessageTime
-                const waitMs = this._config.idleTrigger.intervalMinutes * 60 * 1000
+                const waitMs = (profile.idleIntervalMinutes ?? 180) * 60 * 1000
                 this._logger.debug(`[schedulerTick] ${conversationId}: idle=${Math.floor(idleMs / 1000)}s, need=${Math.floor(waitMs / 1000)}s`)
             }
         }
     }
 
-    private _evaluateTriggers(conversationId: string, state: ConversationState, now: number): TriggerReason | null {
-        if (state.lastTriggerTime && now - state.lastTriggerTime < this._config.cooldownSeconds * 1000) {
+    private _evaluateTriggers(
+        conversationId: string,
+        state: ConversationState,
+        now: number,
+        profile: TriggerProfileConfig
+    ): TriggerReason | null {
+        if (state.lastTriggerTime && now - state.lastTriggerTime < profile.cooldownSeconds * 1000) {
             this._logger.debug(`[evaluateTriggers] ${conversationId}: in cooldown`)
             return null
         }
@@ -165,7 +178,7 @@ export class ProactiveChatService extends Service {
             return null
         }
 
-        if (this._config.enableActivityTrigger) {
+        if (this._isGroupProfile(profile) && profile.enableActivityTrigger) {
             const timestamps = this._messageTimestamps[conversationId] || []
             const score = this._activityScorer.calculateScore(timestamps, state)
             state.lastActivityScore = score
@@ -175,31 +188,30 @@ export class ProactiveChatService extends Service {
             if (this._activityScorer.shouldTrigger(score, state.currentThreshold)) {
                 return {
                     type: 'activity',
-                    reason: '当前群聊氛围十分活跃，以下是群内成员的近期发言，并非在对你发言；优先回应与你相关的问题，若无直接提及你的消息，则根据自身兴趣喜好等信息以旁观者身份自然切入话题；不要假设每条消息都发给你，这十分重要！'
+                    reason: '当前群聊氛围十分活跃，请结合近期上下文自然切入话题。'
                 }
             }
-        }
 
-        if (this._config.messageInterval > 0 && state.messageCount >= this._config.messageInterval) {
-            this._logger.debug(`[evaluateTriggers] ${conversationId}: messageInterval reached (${state.messageCount}/${this._config.messageInterval})`)
-            return {
-                type: 'activity',
-                reason: '当前群聊氛围十分活跃，以下是群内成员的近期发言，并非在对你发言；优先回应与你相关的问题，若无直接提及你的消息，则根据自身兴趣喜好等信息以旁观者身份自然切入话题；不要假设每条消息都发给你，这十分重要！'
+            const messageInterval = profile.activityMessageInterval ?? 20
+            if (messageInterval > 0 && state.messageCount >= messageInterval) {
+                this._logger.debug(`[evaluateTriggers] ${conversationId}: messageInterval reached (${state.messageCount}/${messageInterval})`)
+                return {
+                    type: 'activity',
+                    reason: '消息计数达到阈值，请自然参与当前话题。'
+                }
             }
         }
 
         return null
     }
 
-    /**
-     * 触发 chatluna 主动发言。
-     *
-     * 在 receiveCommand 之前把 room.conversationId → guildId 存入 _pendingBroadcast，
-     * 这样 after-chat 事件触发时（receiveCommand 返回前）就能拿到群 ID 并广播。
-     */
-    private async _triggerResponse(session: Session, trigger: TriggerReason): Promise<void> {
+    private async _triggerResponse(
+        session: Session,
+        trigger: TriggerReason,
+        profile: TriggerProfileConfig
+    ): Promise<void> {
         const conversationId = this._getConversationId(session)
-        const state = this._getOrCreateState(conversationId)
+        const state = this._getOrCreateState(conversationId, profile)
 
         if (state.responseLocked) return
         state.responseLocked = true
@@ -211,16 +223,16 @@ export class ProactiveChatService extends Service {
                 return
             }
 
-            // 群聊时，在触发前注册 pending，after-chat 回调会据此广播到其他 room
             if (!session.isDirect && room.conversationId) {
                 this._pendingBroadcast.set(room.conversationId, session.guildId)
             }
 
-            const useHist = trigger.type !== 'idle'
-            const msgs = useHist ? this._getRecentHistoryMessages(conversationId) : []
+            const template = this._getPromptTemplate(trigger, profile)
+            const useHist = this._shouldUseHistory(template)
+            const msgs = useHist ? this._getRecentHistoryMessages(conversationId, profile) : []
             const { txt: histTxt, imgs } = this._fmtHist(msgs)
-            const bodyTxt = this._buildReqText(trigger.reason, histTxt)
-            const proactiveElements = this._mkEls(bodyTxt, imgs)
+            const bodyTxt = await this._buildReqText(session, trigger, histTxt, template)
+            const proactiveElements = this._mkEls(bodyTxt, useHist ? imgs : [])
             const commandOptions = {
                 message: proactiveElements,
                 is_proactive: true
@@ -246,13 +258,13 @@ export class ProactiveChatService extends Service {
                         roomConversationId: room.conversationId ?? null
                     },
                     history: {
-                        includeChatHistory: this._config.includeChatHistory,
+                        historyCacheAlwaysOn: true,
                         includeHistoryForThisTrigger: useHist,
-                        maxHistoryMessages: this._config.maxHistoryMessages,
+                        historyMessageLimit: profile.historyMessageLimit,
                         cachedMessageCount: this._chatMessages[conversationId]?.length ?? 0,
                         injectedMessageCount: msgs.length,
-                        injectedImageCount: imgs.length,
-                        injectedImages: imgs
+                        injectedImageCount: useHist ? imgs.length : 0,
+                        injectedImages: useHist ? imgs : []
                     },
                     commandOptions: {
                         is_proactive: true,
@@ -271,16 +283,13 @@ export class ProactiveChatService extends Service {
                 commandOptions
             )
 
-            if (useHist) {
-                this._chatMessages[conversationId] = []
-                this._markDirty()
-            }
+            this._chatMessages[conversationId] = []
+            this._markDirty()
 
-            this._updateStateAfterResponse(state)
+            this._updateStateAfterResponse(state, profile)
 
         } catch (error) {
             this._logger.error(`Error triggering proactive response: ${error}`)
-            // 清理 pending，避免悬空
             for (const [key, val] of this._pendingBroadcast) {
                 if (val === session.guildId) this._pendingBroadcast.delete(key)
             }
@@ -289,18 +298,11 @@ export class ProactiveChatService extends Service {
         }
     }
 
-    /**
-     * 将本次主动发言结果同步写入该群内其他所有用户的 room 历史。
-     *
-     * 仅写入已存在 conversationId 的 room（用户至少对话过一次），
-     * 写入内容为一对 HumanMessage('[主动发言触发]') + AIMessage(bot 回复)。
-     */
     private async _syncToAllGroupRooms(
         guildId: string,
         excludeConversationId: string,
         aiMessage: any
     ): Promise<void> {
-        // 查找群内所有用户当前绑定的 room
         const userRecords = await this.ctx.database.get('chathub_user', { groupId: guildId })
         if (userRecords.length <= 1) return
 
@@ -323,20 +325,87 @@ export class ProactiveChatService extends Service {
         }
     }
 
-    private _buildReqText(reason: string, hist: string): string {
-        if (!hist) return reason
-        return `${reason}\n近期对话消息:\n${hist}`
+    private async _buildReqText(
+        session: Session,
+        trigger: TriggerReason,
+        hist: string,
+        template?: string
+    ): Promise<string> {
+        const finalTemplate = template ?? '{trigger_reason}\n{history}'
+        const vars = await this._buildTemplateVars(session, trigger, hist)
+        return this._renderTemplate(finalTemplate, vars)
     }
 
-    private _buildReqContent(txt: string, imgs: string[]) {
-        if (!imgs.length) return txt
-        return [
-            { type: 'text', text: txt },
-            ...imgs.map((url) => ({
-                type: 'image_url',
-                image_url: { url }
-            }))
-        ]
+    private _shouldUseHistory(template: string): boolean {
+        return String(template ?? '').includes('{history}')
+    }
+
+    private _getPromptTemplate(trigger: TriggerReason, profile: TriggerProfileConfig): string {
+        if (trigger.type === 'activity' && this._isGroupProfile(profile) && profile.enableActivityTrigger) {
+            return profile.activityPromptTemplate ?? '{trigger_reason}\n{history}'
+        }
+        if (trigger.type === 'idle' && profile.enableIdleTrigger) {
+            return profile.idlePromptTemplate ?? '{trigger_reason}\n{history}'
+        }
+        return '{trigger_reason}\n{history}'
+    }
+
+    private async _buildTemplateVars(
+        session: Session,
+        trigger: TriggerReason,
+        hist: string
+    ): Promise<Record<string, string>> {
+        const now = new Date()
+        const groupName = await this._getGroupName(session)
+        const userName = this._getUserName(session)
+        const idleMinutes = String(trigger.idleMinutes ?? 0)
+
+        return {
+            history: hist || '(无)',
+            time: this._formatTime(now),
+            date: this._formatDate(now),
+            group_name: groupName,
+            user_name: userName,
+            idle_minutes: idleMinutes,
+            trigger_reason: trigger.reason
+        }
+    }
+
+    private _renderTemplate(template: string, vars: Record<string, string>): string {
+        return String(template ?? '').replace(/\{([a-z_]+)\}/gi, (_match, key: string) => {
+            return vars[key] ?? ''
+        }).trim()
+    }
+
+    private async _getGroupName(session: Session): Promise<string> {
+        if (session.isDirect) return ''
+        try {
+            const guild = await session.bot.getGuild(session.guildId)
+            return guild?.name ?? session.event?.guild?.name ?? ''
+        } catch {
+            return session.event?.guild?.name ?? ''
+        }
+    }
+
+    private _getUserName(session: Session): string {
+        return session.author?.nick
+            || session.author?.name
+            || session.username
+            || session.userId
+            || ''
+    }
+
+    private _formatTime(date: Date): string {
+        return date.toLocaleTimeString('zh-CN', { hour12: false })
+    }
+
+    private _formatDate(date: Date): string {
+        const weekdayMap = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六']
+        const y = date.getFullYear()
+        const m = String(date.getMonth() + 1).padStart(2, '0')
+        const d = String(date.getDate()).padStart(2, '0')
+        const w = weekdayMap[date.getDay()]
+        return `${y}-${m}-${d} ${w}`
     }
 
     private _fmtHist(msgs: ChatMessage[]): { txt: string; imgs: string[] } {
@@ -395,12 +464,12 @@ export class ProactiveChatService extends Service {
         return els
     }
 
-    private _updateStateAfterResponse(state: ConversationState): void {
+    private _updateStateAfterResponse(state: ConversationState, profile: TriggerProfileConfig): void {
         const now = Date.now()
         state.lastTriggerTime = now
         state.messageCount = 0
-        if (this._config.enableActivityTrigger) {
-            this._activityScorer.adjustThreshold(state)
+        if (this._isGroupProfile(profile) && profile.enableActivityTrigger) {
+            this._activityScorer.adjustThreshold(state, profile)
         }
         this._markDirty()
     }
@@ -411,18 +480,101 @@ export class ProactiveChatService extends Service {
             : `group:${session.guildId}`
     }
 
-    private _isApplicable(session: Session): boolean {
+    /**
+     * 根据 session 获取配置
+     * 优先级：精确匹配 > 应用默认配置列表 + default 配置模板
+     */
+    private _getProfileBySession(session: Session): TriggerProfileConfig | null {
         if (session.isDirect) {
-            return this._config.applyPrivateUsers.includes(session.userId)
+            // 1. 首先查找是否有精确匹配的配置（排除 "default"）
+            const exactConfig = this._config.privateConfigs.find(
+                item => item.userId === session.userId && item.userId !== 'default'
+            )
+            if (exactConfig) return exactConfig
+            
+            // 2. 检查是否在应用默认配置列表中
+            if (this._config.applyDefaultPrivateConfigs.includes(session.userId)) {
+                // 查找 default 配置模板
+                const defaultConfig = this._config.privateConfigs.find(item => item.userId === 'default')
+                if (defaultConfig) return defaultConfig
+            }
+            
+            return null
         }
-        return this._config.applyGroup.includes(session.guildId)
+        
+        // 1. 首先查找是否有精确匹配的配置（排除 "default"）
+        const exactConfig = this._config.groupConfigs.find(
+            item => item.guildId === session.guildId && item.guildId !== 'default'
+        )
+        if (exactConfig) return exactConfig
+        
+        // 2. 检查是否在应用默认配置列表中
+        if (this._config.applyDefaultGroupConfigs.includes(session.guildId)) {
+            // 查找 default 配置模板
+            const defaultConfig = this._config.groupConfigs.find(item => item.guildId === 'default')
+            if (defaultConfig) return defaultConfig
+        }
+        
+        return null
     }
 
-    private _getOrCreateState(conversationId: string): ConversationState {
+    /**
+     * 根据 conversationId 获取配置
+     * 优先级：精确匹配 > 应用默认配置列表 + default 配置模板
+     */
+    private _getProfileByConversationId(conversationId: string): TriggerProfileConfig | null {
+        if (conversationId.startsWith('private:')) {
+            const userId = conversationId.slice('private:'.length)
+            
+            // 1. 首先查找是否有精确匹配的配置（排除 "default"）
+            const exactConfig = this._config.privateConfigs.find(
+                item => item.userId === userId && item.userId !== 'default'
+            )
+            if (exactConfig) return exactConfig
+            
+            // 2. 检查是否在应用默认配置列表中
+            if (this._config.applyDefaultPrivateConfigs.includes(userId)) {
+                // 查找 default 配置模板
+                const defaultConfig = this._config.privateConfigs.find(item => item.userId === 'default')
+                if (defaultConfig) return defaultConfig
+            }
+            
+            return null
+        }
+        
+        if (conversationId.startsWith('group:')) {
+            const guildId = conversationId.slice('group:'.length)
+            
+            // 1. 首先查找是否有精确匹配的配置（排除 "default"）
+            const exactConfig = this._config.groupConfigs.find(
+                item => item.guildId === guildId && item.guildId !== 'default'
+            )
+            if (exactConfig) return exactConfig
+            
+            // 2. 检查是否在应用默认配置列表中
+            if (this._config.applyDefaultGroupConfigs.includes(guildId)) {
+                // 查找 default 配置模板
+                const defaultConfig = this._config.groupConfigs.find(item => item.guildId === 'default')
+                if (defaultConfig) return defaultConfig
+            }
+            
+            return null
+        }
+        
+        return null
+    }
+
+    private _isApplicable(session: Session): boolean {
+        return !!this._getProfileBySession(session)
+    }
+
+    private _getOrCreateState(conversationId: string, profile: TriggerProfileConfig): ConversationState {
         if (!this._conversationStates[conversationId]) {
             this._conversationStates[conversationId] = {
                 lastMessageTime: 0,
-                currentThreshold: this._config.activityThreshold.lowerLimit,
+                currentThreshold: this._isGroupProfile(profile) && profile.enableActivityTrigger
+                    ? (profile.activityLowerLimit ?? 0.85)
+                    : 1,
                 lastActivityScore: 0,
                 lastTriggerTime: 0,
                 responseLocked: false,
@@ -458,7 +610,8 @@ export class ProactiveChatService extends Service {
         }
         this._chatMessages[conversationId].push(msg)
 
-        const cap = Math.max(1, this._config.historyBufferSize || this.MAX_MESSAGES)
+        const profile = this._getProfileByConversationId(conversationId)
+        const cap = Math.max(1, profile?.historyMessageLimit || this.MAX_MESSAGES)
         if (this._chatMessages[conversationId].length > cap) {
             this._chatMessages[conversationId] = this._chatMessages[conversationId].slice(-cap)
         }
@@ -484,7 +637,6 @@ export class ProactiveChatService extends Service {
     private _normalizeMessageContent(raw: string, imageCount: number): string {
         let text = String(raw ?? '')
 
-        // 清理常见图片片段，避免将长 URL 写入历史文本
         text = text
             .replace(/\[CQ:image,[^\]]*]/gi, '')
             .replace(/<img\b[^>]*\/?>/gi, '')
@@ -500,23 +652,10 @@ export class ProactiveChatService extends Service {
         return [text, marks].filter(Boolean).join(' ').trim()
     }
 
-    private _getRecentHistory(conversationId: string): string {
-        const recentMessages = this._getRecentHistoryMessages(conversationId)
-        return this._getRecentHistoryFromMessages(recentMessages)
-    }
-
-    private _getRecentHistoryMessages(conversationId: string): ChatMessage[] {
-        if (!this._config.includeChatHistory) return []
+    private _getRecentHistoryMessages(conversationId: string, profile: TriggerProfileConfig): ChatMessage[] {
         const messages = this._chatMessages[conversationId]
         if (!messages || messages.length === 0) return []
-        return messages.slice(-this._config.maxHistoryMessages)
-    }
-
-    private _getRecentHistoryFromMessages(messages: ChatMessage[]): string {
-        if (!messages || messages.length === 0) return ''
-        return messages.map(msg =>
-            `<message name='${msg.name}' id='${msg.id}' timestamp='${this._formatTimestamp(msg.timestamp)}'>${msg.content}</message>`
-        ).join('\n')
+        return messages.slice(-profile.historyMessageLimit)
     }
 
     private _formatTimestamp(timestamp: number): string {
@@ -580,15 +719,31 @@ export class ProactiveChatService extends Service {
     private _sanitizeConversationStates(
         states: Record<string, ConversationState>
     ): Record<string, ConversationState> {
-        const minThreshold = Math.min(this._config.activityThreshold.lowerLimit, this._config.activityThreshold.upperLimit)
-        const maxThreshold = Math.max(this._config.activityThreshold.lowerLimit, this._config.activityThreshold.upperLimit)
         const result: Record<string, ConversationState> = {}
 
         for (const [conversationId, state] of Object.entries(states)) {
             if (!state || typeof state !== 'object') continue
+
+            const profile = this._getProfileByConversationId(conversationId)
+            const isGroupProfile = this._isGroupProfile(profile)
+            const lowerLimit = isGroupProfile ? (profile.activityLowerLimit ?? 0.85) : 0.85
+            const upperLimit = isGroupProfile ? (profile.activityUpperLimit ?? 0.85) : 0.85
+            const minThreshold = isGroupProfile && profile.enableActivityTrigger
+                ? Math.min(lowerLimit, upperLimit)
+                : 1
+            const maxThreshold = isGroupProfile && profile.enableActivityTrigger
+                ? Math.max(lowerLimit, upperLimit)
+                : 1
+
             result[conversationId] = {
                 lastMessageTime: Number(state.lastMessageTime) || 0,
-                currentThreshold: Math.max(minThreshold, Math.min(maxThreshold, Number(state.currentThreshold) || this._config.activityThreshold.lowerLimit)),
+                currentThreshold: Math.max(
+                    minThreshold,
+                    Math.min(
+                        maxThreshold,
+                        Number(state.currentThreshold) || ((isGroupProfile && profile.enableActivityTrigger) ? lowerLimit : 1)
+                    )
+                ),
                 lastActivityScore: Number(state.lastActivityScore) || 0,
                 lastTriggerTime: Number(state.lastTriggerTime) || 0,
                 responseLocked: false,
@@ -634,8 +789,12 @@ export class ProactiveChatService extends Service {
                         imgs
                     }
                 })
-                .slice(-Math.max(1, this._config.historyBufferSize || this.MAX_MESSAGES))
+                .slice(-Math.max(1, this._getProfileByConversationId(conversationId)?.historyMessageLimit || this.MAX_MESSAGES))
         }
         return result
+    }
+
+    private _isGroupProfile(profile: TriggerProfileConfig | null): profile is GroupTriggerConfig {
+        return !!profile && 'enableActivityTrigger' in profile
     }
 }

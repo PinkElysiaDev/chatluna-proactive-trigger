@@ -1,4 +1,4 @@
-import { Config } from './config'
+import { GroupTriggerConfig, TriggerProfileConfig } from './config'
 import { ConversationState } from './types'
 
 /**
@@ -18,12 +18,6 @@ export class ActivityScorer {
         sustainedRate: 10,      // 持续活跃阈值（条/分钟）
         instantRate: 9,         // 瞬时活跃阈值
         burstRate: 12           // 突发活跃阈值
-    }
-
-    private readonly config: Config
-
-    constructor(config: Config) {
-        this.config = config
     }
 
     /**
@@ -67,8 +61,11 @@ export class ActivityScorer {
     /**
      * 调整阈值（自适应）
      */
-    adjustThreshold(state: ConversationState): void {
-        const { lowerLimit, upperLimit } = this.config.activityThreshold
+    adjustThreshold(state: ConversationState, profile: TriggerProfileConfig): void {
+        if (!this._hasActivityTrigger(profile) || !profile.enableActivityTrigger) return
+
+        const lowerLimit = profile.activityLowerLimit ?? 0.85
+        const upperLimit = profile.activityUpperLimit ?? 0.85
         const step = (upperLimit - lowerLimit) * 0.1
         state.currentThreshold = this._clamp(
             state.currentThreshold + step,
@@ -114,5 +111,9 @@ export class ActivityScorer {
         // 60秒半衰期
         const halfLife = 60 * 1000
         return Math.exp(-elapsed / halfLife * Math.log(2))
+    }
+
+    private _hasActivityTrigger(profile: TriggerProfileConfig): profile is GroupTriggerConfig {
+        return 'enableActivityTrigger' in profile
     }
 }
