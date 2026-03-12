@@ -15,6 +15,7 @@ export interface GroupTriggerConfig {
     idlePromptTemplate?: string
 
     historyMessageLimit: number
+    maxRequestImages: number
     cooldownSeconds: number
 }
 
@@ -27,6 +28,7 @@ export interface PrivateTriggerConfig {
     idlePromptTemplate?: string
 
     historyMessageLimit: number
+    maxRequestImages: number
     cooldownSeconds: number
 }
 
@@ -45,6 +47,7 @@ export interface Config {
     syncToAllRooms: boolean
 
     // 调试
+    debugLog: boolean
     verboseLog: boolean
 }
 
@@ -77,6 +80,9 @@ const commonSessionSchema = () => Schema.object({
     historyMessageLimit: Schema.number()
         .min(5).max(1000).default(20)
         .description('历史消息条数上限：同时作为每个会话缓存上限与 {history} 最大注入条数'),
+    maxRequestImages: Schema.number()
+        .min(0).max(20).default(3)
+        .description('请求中的最大图片数量：限制单次主动发言请求中附带的图片总数'),
     cooldownSeconds: Schema.number().min(0).max(3600)
         .default(30)
         .description('触发后冷却时间（秒）'),
@@ -147,6 +153,9 @@ export const Config = Schema.intersect([
         syncToAllRooms: Schema.boolean()
             .default(true)
             .description('主动发言后，将对话记录同步写入该群所有用户的对话历史（仅在每用户独立 room 模式下有效）'),
+        debugLog: Schema.boolean()
+            .default(false)
+            .description('普通日志模式：输出每次触发的触发原因'),
         verboseLog: Schema.boolean()
             .default(false)
             .description('详细日志模式：打印完整的触发请求内容'),

@@ -55,10 +55,12 @@ export const usage = `
 - 配置优先级：精确匹配（特定群号/用户 ID）> 应用默认配置列表 + default 配置模板。
 - 每用户独立 room 场景下，建议开启 syncToAllRooms 减少上下文割裂。
 
-0.2.1 版本更新说明
+0.2.1 & 0.2.2 & 0.2.3 版本更新说明
 - 新增 applyDefaultGroupConfigs 和 applyDefaultPrivateConfigs 应用默认配置列表
 - 支持使用 "default" 作为 guildId/userId 来设置默认配置模板
 - 配置优先级：精确匹配 > 应用默认配置列表 + default 配置模板
+- 新增 debug 日志模式。
+- 新增最大上传图片数量。
 `
 
 export const inject = {

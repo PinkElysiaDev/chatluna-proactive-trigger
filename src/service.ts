@@ -149,11 +149,17 @@ export class ProactiveChatService extends Service {
             const idleTrigger = this._idleScheduler.shouldTrigger(state, now, profile)
             if (idleTrigger) {
                 this._logger.debug(`Idle trigger for ${conversationId}: ${idleTrigger.reason}`)
-                await this._triggerResponse(session, {
-                    type: 'idle',
+                const trigger = {
+                    type: 'idle' as const,
                     reason: idleTrigger.reason,
                     idleMinutes: idleTrigger.silenceMinutes ?? 0
-                }, profile)
+                }
+                if (this._config.debugLog) {
+                    this._logger.info(
+                        `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason} idleMinutes=${trigger.idleMinutes}`
+                    )
+                }
+                await this._triggerResponse(session, trigger, profile)
                 this._markDirty()
             } else if (state.lastMessageTime && profile.enableIdleTrigger) {
                 const idleMs = now - state.lastMessageTime
@@ -186,19 +192,31 @@ export class ProactiveChatService extends Service {
             this._logger.debug(`[evaluateTriggers] ${conversationId}: activityScore=${score.toFixed(3)} threshold=${state.currentThreshold.toFixed(3)}`)
 
             if (this._activityScorer.shouldTrigger(score, state.currentThreshold)) {
-                return {
-                    type: 'activity',
+                const trigger = {
+                    type: 'activity' as const,
                     reason: '当前群聊氛围十分活跃，请结合近期上下文自然切入话题。'
                 }
+                if (this._config.debugLog) {
+                    this._logger.info(
+                        `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason} activityScore=${score.toFixed(3)} threshold=${state.currentThreshold.toFixed(3)}`
+                    )
+                }
+                return trigger
             }
 
             const messageInterval = profile.activityMessageInterval ?? 20
             if (messageInterval > 0 && state.messageCount >= messageInterval) {
                 this._logger.debug(`[evaluateTriggers] ${conversationId}: messageInterval reached (${state.messageCount}/${messageInterval})`)
-                return {
-                    type: 'activity',
+                const trigger = {
+                    type: 'activity' as const,
                     reason: '消息计数达到阈值，请自然参与当前话题。'
                 }
+                if (this._config.debugLog) {
+                    this._logger.info(
+                        `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason} messageCount=${state.messageCount} messageInterval=${messageInterval}`
+                    )
+                }
+                return trigger
             }
         }
 
@@ -232,7 +250,10 @@ export class ProactiveChatService extends Service {
             const msgs = useHist ? this._getRecentHistoryMessages(conversationId, profile) : []
             const { txt: histTxt, imgs } = this._fmtHist(msgs)
             const bodyTxt = await this._buildReqText(session, trigger, histTxt, template)
-            const proactiveElements = this._mkEls(bodyTxt, useHist ? imgs : [])
+            const requestImages = useHist
+                ? imgs.slice(0, Math.max(0, profile.maxRequestImages ?? 3))
+                : []
+            const proactiveElements = this._mkEls(bodyTxt, requestImages)
             const commandOptions = {
                 message: proactiveElements,
                 is_proactive: true
@@ -263,8 +284,8 @@ export class ProactiveChatService extends Service {
                         historyMessageLimit: profile.historyMessageLimit,
                         cachedMessageCount: this._chatMessages[conversationId]?.length ?? 0,
                         injectedMessageCount: msgs.length,
-                        injectedImageCount: useHist ? imgs.length : 0,
-                        injectedImages: useHist ? imgs : []
+                        injectedImageCount: requestImages.length,
+                        injectedImages: requestImages
                     },
                     commandOptions: {
                         is_proactive: true,
