@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-chatluna-proactive-trigger",
   "description": "Automatically trigger chatluna bot with activity-based and idle triggers",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

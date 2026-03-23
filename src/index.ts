@@ -5,62 +5,31 @@ import { Config } from './config'
 export const name = 'chatluna-proactive-trigger'
 
 export const usage = `
-关键参数解析及配置方法：
+为 chatluna 提供群聊活跃度触发与空闲触发的主动发言能力。
 
-1) 基础配置
-- applyDefaultGroupConfigs：应用默认配置的群号列表，列表中的群组将使用默认群聊配置模板。
-- applyDefaultPrivateConfigs：应用默认配置的私聊用户列表，列表中的用户将使用默认私聊配置模板。
-- syncToAllRooms：主动发言后，将对话记录同步写入该群所有用户的对话历史（仅在每用户独立 room 模式下有效）。
-- verboseLog：详细日志模式，排障时开启可输出完整请求快照。
+快速上手：
+- 群聊配置与私聊配置分开维护；将 guildId / userId 设为 "default" 可作为默认模板。
+- applyDefaultGroupConfigs / applyDefaultPrivateConfigs 用于指定哪些群或用户应用默认模板。
+- enableActivityTrigger 用于群聊活跃度触发；enableIdleTrigger 用于群聊或私聊空闲触发。
+- historyMessageLimit 控制历史池容量与单次注入上限；cooldownSeconds 控制触发冷却。
+- enableQuoteReplyByMessageId 只控制是否向群聊活跃度历史中注入 message_id，不再自动追加提示词说明。
+- verboseLog 会为每条消息输出综合判断日志，排障时开启即可。
 
-2) 群聊配置（数组列表）
-- guildId：群号（必填，填写 "default" 作为默认群聊配置模板）。
-- enableActivityTrigger：开启/关闭活跃触发。
-  - activityLowerLimit / activityUpperLimit：
-    - lower = upper：固定灵敏度；
-    - lower < upper：越聊越不容易触发（更克制）；
-    - lower > upper：越聊越容易触发（更积极）。
-  - activityMessageInterval > 0：消息计数兜底触发间隔。
-  - activityPromptTemplate：活跃触发提示词模板。
-- enableIdleTrigger：开启/关闭空闲触发。
-  - idleIntervalMinutes：无人说话达到时长后触发。
-  - idleEnableJitter：开启随机抖动，降低可预测性。
-  - idlePromptTemplate：空闲触发提示词模板。
-- historyMessageLimit：历史消息条数上限（同时作为缓存上限与注入最大条数）。
-- cooldownSeconds：触发后冷却时间（秒）。
+关键行为：
+- 活跃度触发生效时会为参与消息积累的用户按需补建 chatluna room，触发执行仍使用最后发言者的 room。
+- 主动发言后，对话历史自动向本轮参与者的 room 同步。
+- 图片会在每轮群级历史池内缓存到本地，文本中使用 [图片:hash] 标记。
+- 若要让模型输出 <quote id="message_id"/>，请把规则写进 activityPromptTemplate，并配合 chatluna 的 koishi 元素渲染模式使用。
 
-3) 私聊配置（数组列表）
-- userId：私聊用户 ID（必填，填写 "default" 作为默认私聊配置模板）。
-- enableIdleTrigger：开启/关闭空闲触发。
-  - idleIntervalMinutes：无人说话达到时长后触发。
-  - idleEnableJitter：开启随机抖动，降低可预测性。
-  - idlePromptTemplate：空闲触发提示词模板。
-- historyMessageLimit：历史消息条数上限。
-- cooldownSeconds：触发后冷却时间（秒）。
+模板变量：
+- {history} {time} {date} {group_name} {user_name} {idle_minutes}
 
-4) 模板变量
-- {history}：自上次 bot 主动发言以来的历史消息（含图片上传）。
-- {time}：当前时间。
-- {date}：当前年月日星期。
-- {group_name}：当前群聊名称（私聊为空）。
-- {user_name}：当前会话用户昵称。
-- {idle_minutes}：空闲分钟数（空闲触发时有效）。
-- {trigger_reason}：内部触发原因文本。
-
-5) 配置技巧
-- 基础配置放在最前面，便于统一管理同步与日志行为。
-- 群聊和私聊分别使用独立的大标题配置区，每个可配置多个条目。
-- 使用 "default" 标识符设置默认配置模板：将 guildId 或 userId 设置为 "default"，该配置将作为默认配置模板。
-- 使用 applyDefaultGroupConfigs/applyDefaultPrivateConfigs 指定哪些群组/用户应用默认配置模板。
-- 配置优先级：精确匹配（特定群号/用户 ID）> 应用默认配置列表 + default 配置模板。
-- 每用户独立 room 场景下，建议开启 syncToAllRooms 减少上下文割裂。
-
-0.2.1 & 0.2.2 & 0.2.3 版本更新说明
-- 新增 applyDefaultGroupConfigs 和 applyDefaultPrivateConfigs 应用默认配置列表
-- 支持使用 "default" 作为 guildId/userId 来设置默认配置模板
-- 配置优先级：精确匹配 > 应用默认配置列表 + default 配置模板
-- 新增 debug 日志模式。
-- 新增最大上传图片数量。
+### 0.3.0 版本更新内容:
+- 新增消息 id 传递功能，允许用户跳过提示词要求模型引用特定消息回复（需要与 chatluna 主插件 “用 koishi 消息元素渲染”配置项配合使用）
+- 新增补建 chatluna room 能力，解决活跃度对话参与用户缺失 chatluna room 而无法正常触发对话的 bug。
+- 修改主动触发的对话在 room 间同步的逻辑，只为参与当前活跃度触发的用户同步主动触发消息记录。
+- 修复 bot 被用户手动触发后，活跃度对话消息池不重置的 bug，避免 bot 主动发言时对已回应问题重复作答。
+- 修复图片文件持久化策略，每一轮活跃度对话消息池会自我维护一个图片文件池。
 `
 
 export const inject = {

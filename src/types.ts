@@ -1,5 +1,11 @@
 import { Session } from 'koishi'
 
+export interface CachedImageRef {
+    key: string
+    originalUrl: string
+    localPath?: string
+}
+
 /**
  * 群聊消息记录
  */
@@ -8,7 +14,8 @@ export interface ChatMessage {
     name: string
     content: string
     timestamp: number
-    imgs?: string[]
+    messageId?: string
+    imgs?: CachedImageRef[]
 }
 
 /**

@@ -16,6 +16,7 @@ export interface GroupTriggerConfig {
 
     historyMessageLimit: number
     maxRequestImages: number
+    enableQuoteReplyByMessageId: boolean
     cooldownSeconds: number
 }
 
@@ -52,15 +53,44 @@ export interface Config {
 }
 
 const defaultActivityPrompt = [
-    '你现在需要进行一次“活跃触发”的主动发言。',
+    '你现在需要参与到活跃的群聊讨论中。',
     '当前时间：{date} {time}',
     '群聊名称：{group_name}',
-    '触发原因：{trigger_reason}',
     '',
-    '以下是自上次你发言以来的群内消息（可能包含图片）：',
+    '以下是自上次你发言以来的群内消息：',
     '{history}',
     '',
-    '请注意：这些消息未必都在对你说话；优先回应明确提及你的内容，若没有则以自然、简短、不突兀的方式切入。'
+    '十分重要！请注意：这些消息并非都在对你说话；优先回应明确提及或者讨论你的内容，否则以自然、简短、不突兀的方式选择一个你感兴趣的角度切入话题或适度评论。',
+    '',
+    '在生成最终回复时综合以下因素：',
+    '    1.分析历史消息内容: 分析历史消息的讨论话题、每句话有无明确的说话对象（对谁说的）、发言人的情绪/语气/目的 (提问/陈述/闲聊?) 。',
+    '    2.整合自身知识: 回顾角色设定 (性格/知识/图库/行为) 。',
+    '    3.确定发言策略:根据你自己的兴趣点分析是否有必要参与讨论，若你认为群内讨论并不是很有趣则只生成空回复（格式为<message></message>），否则根据你的兴趣点初步制定回应策略 (尊敬/警惕/友好/调戏等)。',
+    '',
+    '输出严格遵循以下规则:',
+    '    你将生成一个 \'<output>\' 标签包裹的回复.\'<output>\' 标签内必须包含一个或多个 \'<message>\' 标签,每个 \'<message>\' 代表一条独立发送的消息.',
+    '    严格遵循**以下定义的格式,所有回复内容都必须放入对应的标签内.**禁止**输出不存在的嵌套.',
+    '',
+    '    Send nothing: <message></message>',
+    '    Text with At function: <message><at id="user_id"> msg</message>',
+    '    Text with Quote function: <message><quote id="message_id"/> msg</message>',
+    '    Text message: <message>msg</message>',
+    '',
+    '    注意事项: @和 msg 之间要用空格隔开.',
+    '     \'<output>\' 标签格式示例:',
+    '',
+    '    <output>',
+    '    <message>嗯？</message>',
+    '    <message>怎么了</message>',
+    '    </output>',
+    '',
+    '    消息引用：你可以选择引用（Quote）感兴趣的历史消息来回应特定话题，若你想回应多个话题，请将每一个回应放在单独的“<message><quote id="message_id"/> msg</message>”标签内',
+    '    @功能: 当你需要@用户时,请从 "上下文" 或 "用户消息" 中获取准确的 "user_id".一次 \'<output>\' 中同一用户只能@一次.',
+    '',
+    '',
+    '    你的最终输出**必须严格**遵循一个固定的标签序列.输出内容**必须**包含 \'<think>\' 和 \'<output>\' 并以 \'<think>\' 标签开始,到 \'<output>\' 标签结束.',
+    '    **严禁**在 \'<think>...</think>\' 中内出现 \'<output>\' 或 \'<message>\' 等任何用于最终输出的标签.',
+    '    **绝对遵循**以下规则和顺序,不要添加任何额外的根标签,也不要转义 XML 特殊字符.'
 ].join('\n')
 
 const defaultIdlePrompt = [
@@ -68,7 +98,6 @@ const defaultIdlePrompt = [
     '当前时间：{date} {time}',
     '群聊名称：{group_name}',
     '已空闲分钟数：{idle_minutes}',
-    '触发原因：{trigger_reason}',
     '',
     '以下是自上次你发言以来的群内消息（可能包含图片）：',
     '{history}',
@@ -106,9 +135,12 @@ const activitySchema = () => Schema.intersect([
             activityMessageInterval: Schema.number().min(0).max(100)
                 .default(20)
                 .description('消息计数触发间隔'),
+            enableQuoteReplyByMessageId: Schema.boolean()
+                .default(false)
+                .description('是否向历史消息中注入 message_id'),
             activityPromptTemplate: Schema.string()
                 .role('textarea', { rows: [8, 20] })
-                .description('活跃触发提示词模板。可用变量：{history} {time} {date} {group_name} {idle_minutes} {trigger_reason}')
+                .description('活跃触发提示词模板。可用变量：{history} {time} {date} {group_name} {idle_minutes}')
                 .default(defaultActivityPrompt),
         }),
         Schema.object({}),
@@ -132,7 +164,7 @@ const idleSchema = () => Schema.intersect([
                 .description('启用随机抖动'),
             idlePromptTemplate: Schema.string()
                 .role('textarea', { rows: [8, 20] })
-                .description('空闲触发提示词模板。可用变量：{history} {time} {date} {group_name} {user_name} {idle_minutes} {trigger_reason}')
+                .description('空闲触发提示词模板。可用变量：{history} {time} {date} {group_name} {user_name} {idle_minutes}')
                 .default(defaultIdlePrompt),
         }),
         Schema.object({}),
