@@ -1,5 +1,11 @@
 import { Session } from 'koishi'
 
+export interface CachedImageRef {
+    key: string
+    originalUrl: string
+    localPath?: string
+}
+
 /**
  * 群聊消息记录
  */
@@ -8,7 +14,8 @@ export interface ChatMessage {
     name: string
     content: string
     timestamp: number
-    imgs?: string[]
+    messageId?: string
+    imgs?: CachedImageRef[]
 }
 
 /**
@@ -75,6 +82,7 @@ export interface IdleTriggerConfig {
  */
 export interface IdleTriggerResult {
     reason: string
+    silenceMinutes?: number
 }
 
 /**
@@ -88,4 +96,5 @@ export type TriggerType = 'activity' | 'idle'
 export interface TriggerReason {
     type: TriggerType
     reason: string
+    idleMinutes?: number
 }
