@@ -34,6 +34,15 @@ export interface ConversationState {
     // 上次触发时间
     lastTriggerTime: number
 
+    // 最近一次失败时间
+    lastFailureTime: number
+
+    // 连续失败次数
+    failureCount: number
+
+    // 是否因达到最大重试次数而暂停自动触发
+    retryDisabled: boolean
+
     // 响应锁
     responseLocked: boolean
 

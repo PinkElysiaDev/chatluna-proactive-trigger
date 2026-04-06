@@ -24,12 +24,8 @@ export const usage = `
 模板变量：
 - {history} {time} {date} {group_name} {user_name} {idle_minutes}
 
-### 0.3.0 版本更新内容:
-- 新增消息 id 传递功能，允许用户跳过提示词要求模型引用特定消息回复（需要与 chatluna 主插件 “用 koishi 消息元素渲染”配置项配合使用）
-- 新增补建 chatluna room 能力，解决活跃度对话参与用户缺失 chatluna room 而无法正常触发对话的 bug。
-- 修改主动触发的对话在 room 间同步的逻辑，只为参与当前活跃度触发的用户同步主动触发消息记录。
-- 修复 bot 被用户手动触发后，活跃度对话消息池不重置的 bug，避免 bot 主动发言时对已回应问题重复作答。
-- 修复图片文件持久化策略，每一轮活跃度对话消息池会自我维护一个图片文件池。
+### 0.3.1 版本更新内容:
+- 新增触发冷却和最大重试次数功能。
 `
 
 export const inject = {

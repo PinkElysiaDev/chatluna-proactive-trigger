@@ -56,8 +56,8 @@ export class ProactiveChatService extends Service {
     private _chatMessages: Record<string, ChatMessage[]> = {}
     private _activityScorer: ActivityScorer
     private _idleScheduler: IdleScheduler
-    private _schedulerDisposable: () => void
-    private _persistenceDisposable: () => void
+    private _schedulerDisposable: (() => void) | null = null
+    private _persistenceDisposable: (() => void) | null = null
     private _logger: Logger
 
     private _dirty = false
@@ -196,6 +196,9 @@ export class ProactiveChatService extends Service {
         const state = this._getOrCreateState(conversationId, profile)
         state.lastMessageTime = now
         state.messageCount = (state.messageCount ?? 0) + 1
+        state.lastFailureTime = 0
+        state.failureCount = 0
+        state.retryDisabled = false
         this._markDirty()
 
         this._logger.debug(`[handleMessage] conversationId=${conversationId} messageCount=${state.messageCount} lastActivityScore=${state.lastActivityScore?.toFixed(3)} threshold=${state.currentThreshold?.toFixed(3)}`)
@@ -264,6 +267,21 @@ export class ProactiveChatService extends Service {
             }
             if (state.responseLocked) {
                 this._logger.debug(`[schedulerTick] ${conversationId}: responseLocked, skipping`)
+                continue
+            }
+            if (state.retryDisabled) {
+                this._logger.debug(`[schedulerTick] ${conversationId}: retry disabled after ${state.failureCount} consecutive failures`)
+                continue
+            }
+
+            const failureCooldownRemaining = state.lastFailureTime
+                ? this._config.failureCooldownSeconds * 1000 - (now - state.lastFailureTime)
+                : 0
+
+            if (failureCooldownRemaining > 0) {
+                this._logger.debug(
+                    `[schedulerTick] ${conversationId}: in failure cooldown, ${Math.ceil(failureCooldownRemaining / 1000)}s remaining`
+                )
                 continue
             }
 
@@ -442,12 +460,28 @@ export class ProactiveChatService extends Service {
             )
 
             this._chatMessages[conversationId] = []
+            state.lastFailureTime = 0
+            state.failureCount = 0
+            state.retryDisabled = false
             this._markDirty()
 
             this._updateStateAfterResponse(state, profile)
 
         } catch (error) {
+            state.lastFailureTime = Date.now()
+            state.failureCount = (state.failureCount ?? 0) + 1
+            state.retryDisabled = this._config.maxRetryAttempts > 0
+                && state.failureCount >= this._config.maxRetryAttempts
+            this._markDirty()
+
             this._logger.error(`主动触发响应失败：${error}`)
+
+            if (state.retryDisabled) {
+                this._logger.warn(
+                    `[triggerResponse] conversationId=${conversationId} reached max retry attempts (${state.failureCount}/${this._config.maxRetryAttempts}), automatic triggering paused until next message`
+                )
+            }
+
             if (pendingConversationId) {
                 this._pendingBroadcast.delete(pendingConversationId)
             }
@@ -521,6 +555,17 @@ export class ProactiveChatService extends Service {
         }
 
         if (trigger.type === 'activity' && !session.isDirect) {
+            if (!session.userId || !session.guildId) {
+                this._logger.warn(
+                    `[resolveExecutionContext] 活跃度触发缺少必要会话标识，guildId=${session.guildId}, userId=${session.userId}`
+                )
+                return {
+                    room: null,
+                    requestSession: session,
+                    resetAfterChat: false
+                }
+            }
+
             const room = await this._ensureUserRoomForGroup(session.userId, session.guildId)
             if (room) {
                 this._logger.info(
@@ -557,9 +602,16 @@ export class ProactiveChatService extends Service {
 
     private async _ensureProactiveRoomForGuild(session: Session): Promise<ManagedRoom | null> {
         const proactiveUserId = '__proactive_trigger__'
+        const guildId = session.guildId
+
+        if (!guildId) {
+            this._logger.warn('[ensureProactiveRoomForGuild] missing guildId in group session')
+            return null
+        }
+
         const userRecords = await this.ctx.database.get('chathub_user', {
             userId: proactiveUserId,
-            groupId: session.guildId
+            groupId: guildId
         })
 
         if (userRecords.length > 0) {
@@ -567,11 +619,11 @@ export class ProactiveChatService extends Service {
             if (room) return room as ManagedRoom
         }
 
-        const templateRoom = await this._findAnyUsableRoomInGuild(session.guildId)
+        const templateRoom = await this._findAnyUsableRoomInGuild(guildId)
             ?? await getTemplateConversationRoom(this.ctx, this.ctx.scope.parent.config)
 
         if (!templateRoom) {
-            this._logger.warn(`Cannot provision proactive room for guild ${session.guildId}: no template room available`)
+            this._logger.warn(`Cannot provision proactive room for guild ${guildId}: no template room available`)
             return null
         }
 
@@ -589,7 +641,7 @@ export class ProactiveChatService extends Service {
         }
 
         await createConversationRoom(this.ctx, this._createProactiveSession(session), room as any)
-        this._logger.info(`Provisioned proactive room ${room.roomId} for guild ${session.guildId}`)
+        this._logger.info(`Provisioned proactive room ${room.roomId} for guild ${guildId}`)
         return room
     }
 
@@ -872,7 +924,7 @@ export class ProactiveChatService extends Service {
     }
 
     private async _getGroupName(session: Session): Promise<string> {
-        if (session.isDirect) return ''
+        if (session.isDirect || !session.guildId) return ''
         try {
             const guild = await session.bot.getGuild(session.guildId)
             return guild?.name ?? session.event?.guild?.name ?? ''
@@ -906,9 +958,13 @@ export class ProactiveChatService extends Service {
         if (!msgs.length) return { txt: '', imgs: [] }
 
         const lines = msgs.map((m) => {
-            const messageIdPrefix = this._isGroupProfile(profile)
-                && profile.enableActivityTrigger
-                && profile.enableQuoteReplyByMessageId
+            const groupProfile: GroupTriggerConfig | null = this._isGroupProfile(profile ?? null)
+                ? (profile as GroupTriggerConfig)
+                : null
+
+            const messageIdPrefix = groupProfile
+                && groupProfile.enableActivityTrigger
+                && groupProfile.enableQuoteReplyByMessageId
                 && m.messageId
                 ? `[message_id=${m.messageId}]`
                 : ''
@@ -950,35 +1006,39 @@ export class ProactiveChatService extends Service {
      */
     private _getProfileBySession(session: Session): TriggerProfileConfig | null {
         if (session.isDirect) {
+            if (!session.userId) return null
+
             // 1. 首先查找是否有精确匹配的配置（排除 "default"）
             const exactConfig = this._config.privateConfigs.find(
                 item => item.userId === session.userId && item.userId !== 'default'
             )
             if (exactConfig) return exactConfig
-            
+
             // 2. 检查是否在应用默认配置列表中
             if (this._config.applyDefaultPrivateConfigs.includes(session.userId)) {
                 // 查找 default 配置模板
                 const defaultConfig = this._config.privateConfigs.find(item => item.userId === 'default')
                 if (defaultConfig) return defaultConfig
             }
-            
+
             return null
         }
-        
+
+        if (!session.guildId) return null
+
         // 1. 首先查找是否有精确匹配的配置（排除 "default"）
         const exactConfig = this._config.groupConfigs.find(
             item => item.guildId === session.guildId && item.guildId !== 'default'
         )
         if (exactConfig) return exactConfig
-        
+
         // 2. 检查是否在应用默认配置列表中
         if (this._config.applyDefaultGroupConfigs.includes(session.guildId)) {
             // 查找 default 配置模板
             const defaultConfig = this._config.groupConfigs.find(item => item.guildId === 'default')
             if (defaultConfig) return defaultConfig
         }
-        
+
         return null
     }
 
@@ -1041,6 +1101,9 @@ export class ProactiveChatService extends Service {
                     : 1,
                 lastActivityScore: 0,
                 lastTriggerTime: 0,
+                lastFailureTime: 0,
+                failureCount: 0,
+                retryDisabled: false,
                 responseLocked: false,
                 messageCount: 0
             }
@@ -1065,20 +1128,24 @@ export class ProactiveChatService extends Service {
 
         const imageUrls = this._pickImageUrls(session)
         const images = await this._cacheImages(conversationId, imageUrls)
-        const profile = this._getProfileByConversationId(conversationId)
+        const profile = this._getProfileByConversationId(conversationId) ?? null
 
         const msg: ChatMessage = {
-            id: session.author?.id || session.userId,
-            name: session.author?.name || session.author?.nick || session.username || 'Unknown',
+            id: session.author?.id ?? session.userId ?? 'unknown',
+            name:
+                session.author?.name ??
+                session.author?.nick ??
+                session.username ??
+                'Unknown',
             content: this._normalizeMessageContent(session.content || '', images),
             timestamp: session.timestamp || Date.now(),
-            messageId: session.messageId,
+            messageId: session.messageId ?? undefined,
             ...(images.length ? { imgs: images } : {})
         }
 
         const cap = Math.max(1, profile?.historyMessageLimit || this.MAX_MESSAGES)
         this._appendChatMessage(conversationId, msg, cap)
-        this._prewarmUserRoomIfNeeded(conversationId, session, profile)
+        this._prewarmUserRoomIfNeeded(conversationId, session, profile ?? null)
     }
 
     private _ensureMessageBucket(conversationId: string): void {
@@ -1101,6 +1168,7 @@ export class ProactiveChatService extends Service {
         profile: TriggerProfileConfig | null
     ): void {
         if (session.isDirect || !profile || !this._isGroupProfile(profile)) return
+        if (!session.guildId || !session.userId) return
 
         const cacheKey = `${session.guildId}:${session.userId}`
         if (this._knownUserRooms.has(cacheKey)) return
@@ -1336,6 +1404,9 @@ export class ProactiveChatService extends Service {
                 ),
                 lastActivityScore: Number(state.lastActivityScore) || 0,
                 lastTriggerTime: Number(state.lastTriggerTime) || 0,
+                lastFailureTime: Number((state as Partial<ConversationState>).lastFailureTime) || 0,
+                failureCount: Number((state as Partial<ConversationState>).failureCount) || 0,
+                retryDisabled: Boolean((state as Partial<ConversationState>).retryDisabled),
                 responseLocked: false,
                 messageCount: Number(state.messageCount) || 0
             }

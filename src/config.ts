@@ -47,6 +47,10 @@ export interface Config {
     // room 同步
     syncToAllRooms: boolean
 
+    // 失败重试控制
+    failureCooldownSeconds: number
+    maxRetryAttempts: number
+
     // 调试
     debugLog: boolean
     verboseLog: boolean
@@ -185,6 +189,14 @@ export const Config = Schema.intersect([
         syncToAllRooms: Schema.boolean()
             .default(true)
             .description('主动发言后，将对话记录同步写入该群所有用户的对话历史（仅在每用户独立 room 模式下有效）'),
+        failureCooldownSeconds: Schema.number()
+            .min(0).max(60 * 60 * 24)
+            .default(60)
+            .description('主动触发失败后的群聊冷却时间（秒）'),
+        maxRetryAttempts: Schema.number()
+            .min(0).max(100)
+            .default(3)
+            .description('主动触发连续失败的最大重试次数'),
         debugLog: Schema.boolean()
             .default(false)
             .description('普通日志模式：输出每次触发的触发原因'),
