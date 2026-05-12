@@ -8,6 +8,7 @@ export interface GroupTriggerConfig {
     activityUpperLimit?: number
     activityMessageInterval?: number
     activityPromptTemplate?: string
+    guaranteedTriggerMinutes?: number
 
     enableIdleTrigger: boolean
     idleIntervalMinutes?: number
@@ -146,6 +147,10 @@ const activitySchema = () => Schema.intersect([
                 .role('textarea', { rows: [8, 20] })
                 .description('活跃触发提示词模板。可用变量：{history} {time} {date} {group_name} {idle_minutes}')
                 .default(defaultActivityPrompt),
+            guaranteedTriggerMinutes: Schema.number()
+                .min(0).max(60 * 24 * 7)
+                .default(0)
+                .description('保底触发间隔（分钟）：距上次活跃度触发超过此时间后，即使活跃度不足也触发一次。设为 0 则不启用'),
         }),
         Schema.object({}),
     ]),

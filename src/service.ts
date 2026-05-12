@@ -305,6 +305,46 @@ export class ProactiveChatService extends Service {
                 const waitMs = (profile.idleIntervalMinutes ?? 180) * 60 * 1000
                 this._logger.debug(`[schedulerTick] ${conversationId}: idle=${Math.floor(idleMs / 1000)}s, need=${Math.floor(waitMs / 1000)}s`)
             }
+
+            // 保底触发检查：
+            // 距上次活跃度触发超过配置的时间阈值，且上次触发后确实有新消息进入本轮活跃度积累周期。
+            // 若上次触发后完全无消息，则应交给 idle trigger 处理，不由活跃度保底触发兜底。
+            if (
+                this._isGroupProfile(profile) &&
+                profile.enableActivityTrigger &&
+                (profile.guaranteedTriggerMinutes ?? 0) > 0 &&
+                state.lastTriggerTime > 0
+            ) {
+                const hasMessageSinceLastTrigger =
+                    state.lastMessageTime > state.lastTriggerTime &&
+                    (state.messageCount ?? 0) > 0
+
+                if (!hasMessageSinceLastTrigger) {
+                    this._logger.debug(
+                        `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no message since last trigger`
+                    )
+                    continue
+                }
+
+                const guaranteedMs = profile.guaranteedTriggerMinutes! * 60 * 1000
+                const elapsedSinceLastTrigger = now - state.lastTriggerTime
+                if (elapsedSinceLastTrigger >= guaranteedMs) {
+                    this._logger.info(
+                        `[schedulerTick] ${conversationId}: guaranteed trigger fired, elapsed=${Math.floor(elapsedSinceLastTrigger / 1000)}s, threshold=${profile.guaranteedTriggerMinutes}min`
+                    )
+                    const trigger: TriggerReason = {
+                        type: 'activity',
+                        reason: '保底触发（距上次活跃度触发超时）'
+                    }
+                    if (this._config.debugLog) {
+                        this._logger.info(
+                            `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason} secondsSinceLastTrigger=${Math.floor(elapsedSinceLastTrigger / 1000)} messageCount=${state.messageCount}`
+                        )
+                    }
+                    await this._triggerResponse(session, trigger, profile)
+                    this._markDirty()
+                }
+            }
         }
     }
 

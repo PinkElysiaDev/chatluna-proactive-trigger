@@ -20,12 +20,16 @@ export const usage = `
 - 主动发言后，对话历史自动向本轮参与者的 room 同步。
 - 图片会在每轮群级历史池内缓存到本地，文本中使用 [图片:hash] 标记。
 - 若要让模型输出 <quote id="message_id"/>，请把规则写进 activityPromptTemplate，并配合 chatluna 的 koishi 元素渲染模式使用。
+- guaranteedTriggerMinutes 为群聊活跃度的保底触发间隔：距上次活跃度触发超过此时间后，即使期间活跃度不足也强制触发一次（适合答疑等低频但需保证响应的场景，设为 0 则不启用）。
 
 模板变量：
 - {history} {time} {date} {group_name} {user_name} {idle_minutes}
 
-### 0.3.1 版本更新内容:
+### 0.3.1 & 0.3.2 版本更新内容:
 - 新增触发冷却和最大重试次数功能。
+- 新增群聊活跃度保底触发功能（guaranteedTriggerMinutes）。
+
+### 请注意：本插件暂不兼容 chatluna 1.4.x版本
 `
 
 export const inject = {
