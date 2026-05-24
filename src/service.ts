@@ -187,7 +187,8 @@ export class ProactiveChatService extends Service {
 
         this._sessions[conversationId] = session
 
-        this._recordTimestamp(conversationId, now)
+        const isDirectChatlunaTrigger =
+            !session.isDirect && this._isDirectChatlunaTriggerMessage(session)
 
         if (!session.isDirect) {
             await this._addChatMessage(conversationId, session)
@@ -195,10 +196,22 @@ export class ProactiveChatService extends Service {
 
         const state = this._getOrCreateState(conversationId, profile)
         state.lastMessageTime = now
-        state.messageCount = (state.messageCount ?? 0) + 1
         state.lastFailureTime = 0
         state.failureCount = 0
         state.retryDisabled = false
+
+        if (isDirectChatlunaTrigger) {
+            this._markDirty()
+            this._logger.debug(
+                `[handleMessage] ${conversationId}: direct ChatLuna trigger detected, recorded as history only and skipped proactive eligibility`
+            )
+            await next()
+            return
+        }
+
+        this._recordTimestamp(conversationId, now)
+        state.lastProactiveEligibleMessageTime = now
+        state.messageCount = (state.messageCount ?? 0) + 1
         this._markDirty()
 
         this._logger.debug(`[handleMessage] conversationId=${conversationId} messageCount=${state.messageCount} lastActivityScore=${state.lastActivityScore?.toFixed(3)} threshold=${state.currentThreshold?.toFixed(3)}`)
@@ -315,13 +328,13 @@ export class ProactiveChatService extends Service {
                 (profile.guaranteedTriggerMinutes ?? 0) > 0 &&
                 state.lastTriggerTime > 0
             ) {
-                const hasMessageSinceLastTrigger =
-                    state.lastMessageTime > state.lastTriggerTime &&
+                const hasEligibleMessageSinceLastTrigger =
+                    (state.lastProactiveEligibleMessageTime ?? 0) > state.lastTriggerTime &&
                     (state.messageCount ?? 0) > 0
 
-                if (!hasMessageSinceLastTrigger) {
+                if (!hasEligibleMessageSinceLastTrigger) {
                     this._logger.debug(
-                        `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no message since last trigger`
+                        `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no proactive-eligible message since last trigger`
                     )
                     continue
                 }
@@ -1136,6 +1149,7 @@ export class ProactiveChatService extends Service {
         if (!this._conversationStates[conversationId]) {
             this._conversationStates[conversationId] = {
                 lastMessageTime: 0,
+                lastProactiveEligibleMessageTime: 0,
                 currentThreshold: this._isGroupProfile(profile) && profile.enableActivityTrigger
                     ? (profile.activityLowerLimit ?? 0.85)
                     : 1,
@@ -1152,6 +1166,51 @@ export class ProactiveChatService extends Service {
         return this._conversationStates[conversationId]
     }
 
+    private _isDirectChatlunaTriggerMessage(session: Session): boolean {
+        const chatlunaConfig = this.ctx.chatluna?.currentConfig
+        const botId = String(session.bot?.userId ?? session.selfId ?? '')
+
+        if (!botId) return false
+
+        if ((session as any).stripped?.atSelf) return true
+
+        const elements = (session.elements ?? []) as any[]
+        if (elements.some((element) =>
+            element?.type === 'at' &&
+            String(element?.attrs?.id ?? element?.attrs?.userId ?? '') === botId
+        )) {
+            return true
+        }
+
+        if (
+            chatlunaConfig?.allowQuoteReply &&
+            String(session.quote?.user?.id ?? '') === botId
+        ) {
+            return true
+        }
+
+        const text = h.select(session.elements ?? [], 'text').join('').trimStart()
+        const botNames = Array.isArray(chatlunaConfig?.botNames)
+            ? chatlunaConfig.botNames.filter(Boolean)
+            : []
+
+        if (
+            chatlunaConfig?.isNickname &&
+            botNames.some((name) => text.startsWith(name))
+        ) {
+            return true
+        }
+
+        if (
+            chatlunaConfig?.isNickNameWithContent &&
+            botNames.some((name) => text.includes(name))
+        ) {
+            return true
+        }
+
+        return false
+    }
+
     private _recordTimestamp(conversationId: string, timestamp: number): void {
         if (!this._messageTimestamps[conversationId]) {
             this._messageTimestamps[conversationId] = []
@@ -1166,9 +1225,17 @@ export class ProactiveChatService extends Service {
     private async _addChatMessage(conversationId: string, session: Session): Promise<void> {
         this._ensureMessageBucket(conversationId)
 
-        const imageUrls = this._pickImageUrls(session)
-        const images = await this._cacheImages(conversationId, imageUrls)
         const profile = this._getProfileByConversationId(conversationId) ?? null
+        const imageUrls = this._pickImageUrls(session)
+
+        if ((profile?.maxRequestImages ?? 3) <= 0 && imageUrls.length > 0) {
+            this._logger.debug(
+                `[addChatMessage] skip image message because maxRequestImages=0, conversationId=${conversationId}, imageCount=${imageUrls.length}`
+            )
+            return
+        }
+
+        const images = await this._cacheImages(conversationId, imageUrls)
 
         const msg: ChatMessage = {
             id: session.author?.id ?? session.userId ?? 'unknown',
@@ -1435,6 +1502,7 @@ export class ProactiveChatService extends Service {
 
             result[conversationId] = {
                 lastMessageTime: Number(state.lastMessageTime) || 0,
+                lastProactiveEligibleMessageTime: Number((state as Partial<ConversationState>).lastProactiveEligibleMessageTime) || 0,
                 currentThreshold: Math.max(
                     minThreshold,
                     Math.min(

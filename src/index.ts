@@ -25,9 +25,10 @@ export const usage = `
 模板变量：
 - {history} {time} {date} {group_name} {user_name} {idle_minutes}
 
-### 0.3.1 & 0.3.2 版本更新内容:
+### 0.3.1 & 0.3.2 & 0.3.3 版本更新内容:
 - 新增触发冷却和最大重试次数功能。
 - 新增群聊活跃度保底触发功能（guaranteedTriggerMinutes）。
+- 修复设计行为外的误触发现象。
 
 ### 请注意：本插件暂不兼容 chatluna 1.4.x版本
 `
