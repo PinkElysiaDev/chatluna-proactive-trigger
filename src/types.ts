@@ -25,6 +25,9 @@ export interface ConversationState {
     // 最后一条消息时间（包括直接触发 ChatLuna 的消息）
     lastMessageTime: number
 
+    // 当前活跃度周期内第一条可用于 proactive 活跃度/保底触发统计的消息时间
+    firstProactiveEligibleMessageTime: number
+
     // 最后一条可用于 proactive 活跃度/保底触发统计的消息时间
     lastProactiveEligibleMessageTime: number
 
