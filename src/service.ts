@@ -178,6 +178,14 @@ export class ProactiveChatService extends Service {
                 idleMinutes: 0,
                 idleIntervalMinutes: null,
                 idleEligible: false,
+                guaranteedEnabled: false,
+                guaranteedMinutes: null,
+                guaranteedLastTriggerTime: 0,
+                guaranteedLastEligibleMessageTime: 0,
+                guaranteedElapsedSeconds: null,
+                guaranteedRemainingSeconds: null,
+                guaranteedHasEligibleMessage: false,
+                guaranteedEligible: false,
                 triggerReason: null,
                 finalDecision: 'no-profile'
             })
@@ -226,6 +234,23 @@ export class ProactiveChatService extends Service {
         const idleMinutes = state.lastMessageTime ? Math.max(0, (now - state.lastMessageTime) / 60000) : 0
         const idleIntervalMinutes = idleEnabled ? (profile.idleIntervalMinutes ?? 180) : null
         const idleEligible = !!(idleEnabled && idleIntervalMinutes != null && idleMinutes >= idleIntervalMinutes)
+        const guaranteedEnabled = activityEnabled && (profile.guaranteedTriggerMinutes ?? 0) > 0
+        const guaranteedMinutes = guaranteedEnabled && this._isGroupProfile(profile)
+            ? profile.guaranteedTriggerMinutes ?? 0
+            : null
+        const guaranteedElapsedSeconds = guaranteedEnabled && state.lastTriggerTime > 0
+            ? Math.floor((now - state.lastTriggerTime) / 1000)
+            : null
+        const guaranteedRemainingSeconds = guaranteedEnabled && guaranteedMinutes != null && state.lastTriggerTime > 0
+            ? Math.max(0, Math.ceil((guaranteedMinutes * 60 * 1000 - (now - state.lastTriggerTime)) / 1000))
+            : null
+        const guaranteedHasEligibleMessage = guaranteedEnabled
+            ? (state.lastProactiveEligibleMessageTime ?? 0) > state.lastTriggerTime && (state.messageCount ?? 0) > 0
+            : false
+        const guaranteedEligible = guaranteedEnabled &&
+            state.lastTriggerTime > 0 &&
+            guaranteedHasEligibleMessage &&
+            guaranteedRemainingSeconds === 0
 
         this._logMessageEvaluation(session, {
             conversationId,
@@ -242,6 +267,14 @@ export class ProactiveChatService extends Service {
             idleMinutes,
             idleIntervalMinutes,
             idleEligible,
+            guaranteedEnabled,
+            guaranteedMinutes,
+            guaranteedLastTriggerTime: state.lastTriggerTime,
+            guaranteedLastEligibleMessageTime: state.lastProactiveEligibleMessageTime ?? 0,
+            guaranteedElapsedSeconds,
+            guaranteedRemainingSeconds,
+            guaranteedHasEligibleMessage,
+            guaranteedEligible,
             triggerReason: triggerReason?.reason ?? null,
             finalDecision: triggerReason
                 ? `${triggerReason.type}-trigger`
@@ -322,25 +355,35 @@ export class ProactiveChatService extends Service {
             // 保底触发检查：
             // 距上次活跃度触发超过配置的时间阈值，且上次触发后确实有新消息进入本轮活跃度积累周期。
             // 若上次触发后完全无消息，则应交给 idle trigger 处理，不由活跃度保底触发兜底。
-            if (
-                this._isGroupProfile(profile) &&
-                profile.enableActivityTrigger &&
-                (profile.guaranteedTriggerMinutes ?? 0) > 0 &&
-                state.lastTriggerTime > 0
-            ) {
+            if (this._isGroupProfile(profile) && profile.enableActivityTrigger && (profile.guaranteedTriggerMinutes ?? 0) > 0) {
+                if (state.lastTriggerTime <= 0) {
+                    this._logger.debug(
+                        `[schedulerTick] ${conversationId}: guaranteed trigger skipped, lastTriggerTime=0, guaranteedMinutes=${profile.guaranteedTriggerMinutes}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
+                    )
+                    continue
+                }
+
                 const hasEligibleMessageSinceLastTrigger =
                     (state.lastProactiveEligibleMessageTime ?? 0) > state.lastTriggerTime &&
                     (state.messageCount ?? 0) > 0
 
                 if (!hasEligibleMessageSinceLastTrigger) {
                     this._logger.debug(
-                        `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no proactive-eligible message since last trigger`
+                        `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no proactive-eligible message since last trigger, lastTriggerTime=${state.lastTriggerTime}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
                     )
                     continue
                 }
 
                 const guaranteedMs = profile.guaranteedTriggerMinutes! * 60 * 1000
                 const elapsedSinceLastTrigger = now - state.lastTriggerTime
+                const guaranteedRemainingMs = guaranteedMs - elapsedSinceLastTrigger
+                if (elapsedSinceLastTrigger < guaranteedMs) {
+                    this._logger.debug(
+                        `[schedulerTick] ${conversationId}: guaranteed trigger waiting, elapsed=${Math.floor(elapsedSinceLastTrigger / 1000)}s, remaining=${Math.ceil(guaranteedRemainingMs / 1000)}s, threshold=${profile.guaranteedTriggerMinutes}min, lastTriggerTime=${state.lastTriggerTime}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
+                    )
+                    continue
+                }
+
                 if (elapsedSinceLastTrigger >= guaranteedMs) {
                     this._logger.info(
                         `[schedulerTick] ${conversationId}: guaranteed trigger fired, elapsed=${Math.floor(elapsedSinceLastTrigger / 1000)}s, threshold=${profile.guaranteedTriggerMinutes}min`
@@ -351,7 +394,7 @@ export class ProactiveChatService extends Service {
                     }
                     if (this._config.debugLog) {
                         this._logger.info(
-                            `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason} secondsSinceLastTrigger=${Math.floor(elapsedSinceLastTrigger / 1000)} messageCount=${state.messageCount}`
+                            `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason} secondsSinceLastTrigger=${Math.floor(elapsedSinceLastTrigger / 1000)} guaranteedMinutes=${profile.guaranteedTriggerMinutes} lastTriggerTime=${state.lastTriggerTime} lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0} messageCount=${state.messageCount}`
                         )
                     }
                     await this._triggerResponse(session, trigger, profile)
@@ -910,6 +953,14 @@ export class ProactiveChatService extends Service {
             idleMinutes: number
             idleIntervalMinutes: number | null
             idleEligible: boolean
+            guaranteedEnabled: boolean
+            guaranteedMinutes: number | null
+            guaranteedLastTriggerTime: number
+            guaranteedLastEligibleMessageTime: number
+            guaranteedElapsedSeconds: number | null
+            guaranteedRemainingSeconds: number | null
+            guaranteedHasEligibleMessage: boolean
+            guaranteedEligible: boolean
             triggerReason: string | null
             finalDecision: string
         }
@@ -918,9 +969,10 @@ export class ProactiveChatService extends Service {
 
         const activityPart = `activity={enabled:${payload.activityEnabled},score:${payload.activityScore == null ? 'n/a' : payload.activityScore.toFixed(3)},threshold:${payload.activityThreshold == null ? 'n/a' : payload.activityThreshold.toFixed(3)},messageCount:${payload.messageCount},messageInterval:${payload.messageInterval ?? 'n/a'},triggered:${payload.activityTriggered}}`
         const idlePart = `idle={enabled:${payload.idleEnabled},idleMinutes:${payload.idleMinutes.toFixed(2)},intervalMinutes:${payload.idleIntervalMinutes ?? 'n/a'},eligible:${payload.idleEligible}}`
+        const guaranteedPart = `guaranteed={enabled:${payload.guaranteedEnabled},minutes:${payload.guaranteedMinutes ?? 'n/a'},lastTriggerTime:${payload.guaranteedLastTriggerTime},lastEligibleMessageTime:${payload.guaranteedLastEligibleMessageTime},elapsedSeconds:${payload.guaranteedElapsedSeconds ?? 'n/a'},remainingSeconds:${payload.guaranteedRemainingSeconds ?? 'n/a'},hasEligibleMessage:${payload.guaranteedHasEligibleMessage},eligible:${payload.guaranteedEligible}}`
 
         this._logger.info(
-            `[verboseLog][message-eval] conversationId=${payload.conversationId} guildId=${session.guildId ?? ''} userId=${session.userId ?? ''} isDirect=${session.isDirect} profile=${payload.profileType} cooldownRemainingMs=${payload.cooldownRemainingMs} responseLocked=${payload.responseLocked} ${activityPart} ${idlePart} finalDecision=${payload.finalDecision}${payload.triggerReason ? ` reason="${payload.triggerReason}"` : ''}`
+            `[verboseLog][message-eval] conversationId=${payload.conversationId} guildId=${session.guildId ?? ''} userId=${session.userId ?? ''} isDirect=${session.isDirect} profile=${payload.profileType} cooldownRemainingMs=${payload.cooldownRemainingMs} responseLocked=${payload.responseLocked} ${activityPart} ${idlePart} ${guaranteedPart} finalDecision=${payload.finalDecision}${payload.triggerReason ? ` reason="${payload.triggerReason}"` : ''}`
         )
     }
 
