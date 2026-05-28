@@ -18,20 +18,21 @@ export const usage = `
 关键行为：
 - 活跃度触发生效时会为参与消息积累的用户按需补建 chatluna room，触发执行仍使用最后发言者的 room。
 - 主动发言后，对话历史自动向本轮参与者的 room 同步。
-- 图片会在每轮群级历史池内缓存到本地，文本中使用 [图片:hash] 标记。
+- 图片会在每轮群级历史池内缓存到本地，文本中使用 [图片:hash] 标记；注入给 chatluna 时会将本地缓存图片转换为 data URL，避免本地文件路径被 chatluna 当作 HTTP URL 读取。
 - 若要让模型输出 <quote id="message_id"/>，请把规则写进 activityPromptTemplate，并配合 chatluna 的 koishi 元素渲染模式使用。
 - guaranteedTriggerMinutes 为群聊活跃度的保底触发间隔：若本轮尚未主动触发过，则从本轮第一条可参与 proactive 统计的消息开始计时；若已经主动触发过，则从上次主动触发开始计时。超过此时间后，即使期间活跃度不足也强制触发一次（适合答疑等低频但需保证响应的场景，设为 0 则不启用）。
 
 模板变量：
 - {history} {time} {date} {group_name} {user_name} {idle_minutes}
 
-### 0.3.1 & 0.3.2 & 0.3.3 & 0.3.4 & 0.3.5 & 0.3.6 版本更新内容:
+### 0.3.1 & 0.3.2 & 0.3.3 & 0.3.4 & 0.3.5 & 0.3.6 & 0.3.7 版本更新内容:
 - 新增触发冷却和最大重试次数功能。
 - 新增群聊活跃度保底触发功能（guaranteedTriggerMinutes）。
 - 修复设计行为外的误触发现象。
 - 增添时间保底触发功能的 debug 日志。
 - 修复首次未发生活跃度触发时，保底触发无法生效的问题。
 - 修复时间保底触发未按期望工作的 bug 。
+- 修复主动触发携带本地缓存图片时，chatluna 将本地路径当作 URL 导致 Invalid URL 的问题。
 
 ### 请注意：本插件暂不兼容 chatluna 1.4.x版本
 `

@@ -571,11 +571,11 @@ export class ProactiveChatService extends Service {
                         cachedMessageCount: this._chatMessages[conversationId]?.length ?? 0,
                         injectedMessageCount: msgs.length,
                         injectedImageCount: requestImages.length,
-                        injectedImages: requestImages
+                        injectedImages: requestImages.map((image) => this._formatVerboseImageRef(image))
                     },
                     commandOptions: {
                         is_proactive: true,
-                        messagePreview: proactiveElements.map((el) => el?.toString?.(true) ?? String(el))
+                        messagePreview: proactiveElements.map((el) => this._formatElementPreview(el))
                     }
                 }
 
@@ -1479,14 +1479,15 @@ export class ProactiveChatService extends Service {
         for (const message of messages) {
             for (const image of message.imgs ?? []) {
                 if (image.localPath) {
-                    try {
-                        await fs.access(image.localPath)
-                        if (!seen.has(image.localPath)) {
-                            seen.add(image.localPath)
-                            sources.push(image.localPath)
+                    const dataUrl = await this._readCachedImageAsDataUrl(image)
+                    if (dataUrl) {
+                        const dataUrlKey = `data:${image.key}`
+                        if (!seen.has(dataUrlKey)) {
+                            seen.add(dataUrlKey)
+                            sources.push(dataUrl)
                         }
                         continue
-                    } catch {}
+                    }
                 }
 
                 if (!seen.has(image.originalUrl)) {
@@ -1497,6 +1498,94 @@ export class ProactiveChatService extends Service {
         }
 
         return sources
+    }
+
+    private async _readCachedImageAsDataUrl(image: CachedImageRef): Promise<string | null> {
+        if (!image.localPath) return null
+
+        try {
+            const buffer = await fs.readFile(image.localPath)
+            const mimeType = this._detectImageMimeType(buffer)
+            if (!mimeType) {
+                this._logger.warn(
+                    `[resolveImageSources] 无法识别本地缓存图片类型，fallback 到原始 URL，key=${image.key}, localPath=${image.localPath}`
+                )
+                return null
+            }
+
+            return `data:${mimeType};base64,${buffer.toString('base64')}`
+        } catch (error) {
+            this._logger.warn(
+                `[resolveImageSources] 读取本地缓存图片失败，fallback 到原始 URL，key=${image.key}, localPath=${image.localPath}, error=${error}`
+            )
+            return null
+        }
+    }
+
+    private _detectImageMimeType(buffer: Buffer): string | null {
+        if (buffer.length >= 8 &&
+            buffer[0] === 0x89 &&
+            buffer[1] === 0x50 &&
+            buffer[2] === 0x4e &&
+            buffer[3] === 0x47 &&
+            buffer[4] === 0x0d &&
+            buffer[5] === 0x0a &&
+            buffer[6] === 0x1a &&
+            buffer[7] === 0x0a
+        ) {
+            return 'image/png'
+        }
+
+        if (buffer.length >= 3 &&
+            buffer[0] === 0xff &&
+            buffer[1] === 0xd8 &&
+            buffer[2] === 0xff
+        ) {
+            return 'image/jpeg'
+        }
+
+        if (buffer.length >= 6) {
+            const signature = buffer.subarray(0, 6).toString('ascii')
+            if (signature === 'GIF87a' || signature === 'GIF89a') {
+                return 'image/gif'
+            }
+        }
+
+        if (buffer.length >= 12 &&
+            buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+            buffer.subarray(8, 12).toString('ascii') === 'WEBP'
+        ) {
+            return 'image/webp'
+        }
+
+        if (buffer.length >= 2 &&
+            buffer[0] === 0x42 &&
+            buffer[1] === 0x4d
+        ) {
+            return 'image/bmp'
+        }
+
+        return null
+    }
+
+    private _formatVerboseImageRef(source: string): string {
+        if (source.startsWith('data:image')) {
+            const mimeMatch = source.match(/^data:([^;]+);base64,/)
+            const mimeType = mimeMatch?.[1] ?? 'image/unknown'
+            const base64Length = source.length - (mimeMatch?.[0].length ?? 0)
+            return `data-url:${mimeType};base64Length=${base64Length}`
+        }
+
+        return source
+    }
+
+    private _formatElementPreview(element: any): string {
+        if (element?.type === 'img' || element?.type === 'image') {
+            const source = String(element?.attrs?.url ?? element?.attrs?.src ?? '')
+            return `<${element.type} src="${this._formatVerboseImageRef(source)}"/>`
+        }
+
+        return element?.toString?.(true) ?? String(element)
     }
 
     private async _clearConversationImageCache(conversationId: string): Promise<void> {
