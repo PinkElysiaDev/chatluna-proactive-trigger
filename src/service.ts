@@ -201,8 +201,9 @@ export class ProactiveChatService extends Service {
         const isDirectChatlunaTrigger =
             !session.isDirect && this._isDirectChatlunaTriggerMessage(session)
 
+        let shouldCountForProactive = true
         if (!session.isDirect) {
-            await this._addChatMessage(conversationId, session)
+            shouldCountForProactive = await this._addChatMessage(conversationId, session)
         }
 
         const state = this._getOrCreateState(conversationId, profile)
@@ -214,7 +215,16 @@ export class ProactiveChatService extends Service {
         if (isDirectChatlunaTrigger) {
             this._markDirty()
             this._logger.debug(
-                `[handleMessage] ${conversationId}: direct ChatLuna trigger detected, recorded as history only and skipped proactive eligibility`
+                `[handleMessage] ${conversationId}: direct ChatLuna trigger detected, skipped proactive eligibility`
+            )
+            await next()
+            return
+        }
+
+        if (!shouldCountForProactive) {
+            this._markDirty()
+            this._logger.debug(
+                `[handleMessage] ${conversationId}: message skipped from proactive eligibility because it was not recorded in proactive history`
             )
             await next()
             return
@@ -1314,7 +1324,7 @@ export class ProactiveChatService extends Service {
         this._markDirty()
     }
 
-    private async _addChatMessage(conversationId: string, session: Session): Promise<void> {
+    private async _addChatMessage(conversationId: string, session: Session): Promise<boolean> {
         this._ensureMessageBucket(conversationId)
 
         const profile = this._getProfileByConversationId(conversationId) ?? null
@@ -1322,9 +1332,9 @@ export class ProactiveChatService extends Service {
 
         if ((profile?.maxRequestImages ?? 3) <= 0 && imageUrls.length > 0) {
             this._logger.debug(
-                `[addChatMessage] skip image message because maxRequestImages=0, conversationId=${conversationId}, imageCount=${imageUrls.length}`
+                `[addChatMessage] skip image message because maxRequestImages=0, conversationId=${conversationId}, imageCount=${imageUrls.length}, proactiveEligible=false`
             )
-            return
+            return false
         }
 
         const images = await this._cacheImages(conversationId, imageUrls)
@@ -1345,6 +1355,7 @@ export class ProactiveChatService extends Service {
         const cap = Math.max(1, profile?.historyMessageLimit || this.MAX_MESSAGES)
         this._appendChatMessage(conversationId, msg, cap)
         this._prewarmUserRoomIfNeeded(conversationId, session, profile ?? null)
+        return true
     }
 
     private _ensureMessageBucket(conversationId: string): void {
