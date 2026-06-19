@@ -112,4 +112,6 @@ export interface TriggerReason {
     type: TriggerType
     reason: string
     idleMinutes?: number
+    // 仅在成功触发后用于 debugLog 输出的附加上下文（不参与触发判断）
+    debugDetail?: string
 }

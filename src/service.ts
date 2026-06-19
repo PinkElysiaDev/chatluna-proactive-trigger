@@ -118,12 +118,12 @@ export class ProactiveChatService extends Service {
                     this._chatMessages[pluginConversationId] = []
                     await this._clearConversationImageCache(pluginConversationId)
                     this._markDirty()
-                    this._logger.info(
+                    this._debug(
                         `[after-chat][reset-group-history] conversationId=${conversationId} groupId=${guildId} reset=true`
                     )
                 }
             } else {
-                this._logger.debug(
+                this._debug(
                     `[after-chat][reset-group-history] conversationId=${conversationId} groupId=unknown skip`
                 )
             }
@@ -192,7 +192,7 @@ export class ProactiveChatService extends Service {
                 triggerReason: null,
                 finalDecision: 'no-profile'
             })
-            this._logger.debug(`[handleMessage] session not applicable: uid=${session.uid} guildId=${session.guildId} isDirect=${session.isDirect}`)
+            this._debug(`[handleMessage] session not applicable: uid=${session.uid} guildId=${session.guildId} isDirect=${session.isDirect}`)
             await next(); return
         }
 
@@ -214,7 +214,7 @@ export class ProactiveChatService extends Service {
 
         if (isDirectChatlunaTrigger) {
             this._markDirty()
-            this._logger.debug(
+            this._debug(
                 `[handleMessage] ${conversationId}: direct ChatLuna trigger detected, skipped proactive eligibility`
             )
             await next()
@@ -223,7 +223,7 @@ export class ProactiveChatService extends Service {
 
         if (!shouldCountForProactive) {
             this._markDirty()
-            this._logger.debug(
+            this._debug(
                 `[handleMessage] ${conversationId}: message skipped from proactive eligibility because it was not recorded in proactive history`
             )
             await next()
@@ -238,7 +238,7 @@ export class ProactiveChatService extends Service {
         state.messageCount = (state.messageCount ?? 0) + 1
         this._markDirty()
 
-        this._logger.debug(`[handleMessage] conversationId=${conversationId} messageCount=${state.messageCount} lastActivityScore=${state.lastActivityScore?.toFixed(3)} threshold=${state.currentThreshold?.toFixed(3)}`)
+        this._debug(`[handleMessage] conversationId=${conversationId} messageCount=${state.messageCount} lastActivityScore=${state.lastActivityScore?.toFixed(3)} threshold=${state.currentThreshold?.toFixed(3)}`)
 
         const triggerReason = this._evaluateTriggers(conversationId, state, now, profile)
         const cooldownRemainingMs = state.lastTriggerTime
@@ -341,15 +341,15 @@ export class ProactiveChatService extends Service {
                 : 0
 
             if (cooldownRemaining > 0) {
-                this._logger.debug(`[schedulerTick] ${conversationId}: in cooldown, ${Math.ceil(cooldownRemaining / 1000)}s remaining`)
+                this._debug(`[schedulerTick] ${conversationId}: in cooldown, ${Math.ceil(cooldownRemaining / 1000)}s remaining`)
                 continue
             }
             if (state.responseLocked) {
-                this._logger.debug(`[schedulerTick] ${conversationId}: responseLocked, skipping`)
+                this._debug(`[schedulerTick] ${conversationId}: responseLocked, skipping`)
                 continue
             }
             if (state.retryDisabled) {
-                this._logger.debug(`[schedulerTick] ${conversationId}: retry disabled after ${state.failureCount} consecutive failures`)
+                this._debug(`[schedulerTick] ${conversationId}: retry disabled after ${state.failureCount} consecutive failures`)
                 continue
             }
 
@@ -358,7 +358,7 @@ export class ProactiveChatService extends Service {
                 : 0
 
             if (failureCooldownRemaining > 0) {
-                this._logger.debug(
+                this._debug(
                     `[schedulerTick] ${conversationId}: in failure cooldown, ${Math.ceil(failureCooldownRemaining / 1000)}s remaining`
                 )
                 continue
@@ -366,23 +366,18 @@ export class ProactiveChatService extends Service {
 
             const idleTrigger = this._idleScheduler.shouldTrigger(state, now, profile)
             if (idleTrigger) {
-                this._logger.debug(`Idle trigger for ${conversationId}: ${idleTrigger.reason}`)
                 const trigger = {
                     type: 'idle' as const,
                     reason: '空闲时间触发',
-                    idleMinutes: idleTrigger.silenceMinutes ?? 0
-                }
-                if (this._config.debugLog) {
-                    this._logger.info(
-                        `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason} idleMinutes=${trigger.idleMinutes}`
-                    )
+                    idleMinutes: idleTrigger.silenceMinutes ?? 0,
+                    debugDetail: `idleMinutes=${idleTrigger.silenceMinutes ?? 0}`
                 }
                 await this._triggerResponse(session, trigger, profile)
                 this._markDirty()
             } else if (state.lastMessageTime && profile.enableIdleTrigger) {
                 const idleMs = now - state.lastMessageTime
                 const waitMs = (profile.idleIntervalMinutes ?? 180) * 60 * 1000
-                this._logger.debug(`[schedulerTick] ${conversationId}: idle=${Math.floor(idleMs / 1000)}s, need=${Math.floor(waitMs / 1000)}s`)
+                this._debug(`[schedulerTick] ${conversationId}: idle=${Math.floor(idleMs / 1000)}s, need=${Math.floor(waitMs / 1000)}s`)
             }
 
             // 保底触发检查：
@@ -401,7 +396,7 @@ export class ProactiveChatService extends Service {
                         : 0
 
                 if (guaranteedBaseTime <= 0) {
-                    this._logger.debug(
+                    this._debug(
                         `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no base time, guaranteedMinutes=${profile.guaranteedTriggerMinutes}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastTriggerTime=${state.lastTriggerTime}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
                     )
                     continue
@@ -413,7 +408,7 @@ export class ProactiveChatService extends Service {
                         : (state.firstProactiveEligibleMessageTime ?? 0) > 0 && (state.messageCount ?? 0) > 0
 
                 if (!hasEligibleMessageForGuaranteed) {
-                    this._logger.debug(
+                    this._debug(
                         `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no proactive-eligible message for current guaranteed cycle, baseType=${guaranteedBaseType}, baseTime=${guaranteedBaseTime}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastTriggerTime=${state.lastTriggerTime}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
                     )
                     continue
@@ -423,24 +418,17 @@ export class ProactiveChatService extends Service {
                 const elapsedSinceGuaranteedBase = now - guaranteedBaseTime
                 const guaranteedRemainingMs = guaranteedMs - elapsedSinceGuaranteedBase
                 if (elapsedSinceGuaranteedBase < guaranteedMs) {
-                    this._logger.debug(
+                    this._debug(
                         `[schedulerTick] ${conversationId}: guaranteed trigger waiting, baseType=${guaranteedBaseType}, elapsed=${Math.floor(elapsedSinceGuaranteedBase / 1000)}s, remaining=${Math.ceil(guaranteedRemainingMs / 1000)}s, threshold=${profile.guaranteedTriggerMinutes}min, baseTime=${guaranteedBaseTime}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastTriggerTime=${state.lastTriggerTime}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
                     )
                     continue
                 }
 
                 if (elapsedSinceGuaranteedBase >= guaranteedMs) {
-                    this._logger.info(
-                        `[schedulerTick] ${conversationId}: guaranteed trigger fired, baseType=${guaranteedBaseType}, elapsed=${Math.floor(elapsedSinceGuaranteedBase / 1000)}s, threshold=${profile.guaranteedTriggerMinutes}min`
-                    )
                     const trigger: TriggerReason = {
                         type: 'activity',
-                        reason: '保底触发（距上次活跃度触发超时）'
-                    }
-                    if (this._config.debugLog) {
-                        this._logger.info(
-                            `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason} guaranteedBaseType=${guaranteedBaseType} secondsSinceGuaranteedBase=${Math.floor(elapsedSinceGuaranteedBase / 1000)} guaranteedMinutes=${profile.guaranteedTriggerMinutes} baseTime=${guaranteedBaseTime} firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0} lastTriggerTime=${state.lastTriggerTime} lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0} messageCount=${state.messageCount}`
-                        )
+                        reason: '保底触发（距上次活跃度触发超时）',
+                        debugDetail: `guaranteedBaseType=${guaranteedBaseType} secondsSinceGuaranteedBase=${Math.floor(elapsedSinceGuaranteedBase / 1000)} guaranteedMinutes=${profile.guaranteedTriggerMinutes} baseTime=${guaranteedBaseTime} firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0} lastTriggerTime=${state.lastTriggerTime} lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0} messageCount=${state.messageCount}`
                     }
                     await this._triggerResponse(session, trigger, profile)
                     this._markDirty()
@@ -456,11 +444,11 @@ export class ProactiveChatService extends Service {
         profile: TriggerProfileConfig
     ): TriggerReason | null {
         if (state.lastTriggerTime && now - state.lastTriggerTime < profile.cooldownSeconds * 1000) {
-            this._logger.debug(`[evaluateTriggers] ${conversationId}: in cooldown`)
+            this._debug(`[evaluateTriggers] ${conversationId}: in cooldown`)
             return null
         }
         if (state.responseLocked) {
-            this._logger.debug(`[evaluateTriggers] ${conversationId}: responseLocked`)
+            this._debug(`[evaluateTriggers] ${conversationId}: responseLocked`)
             return null
         }
 
@@ -469,32 +457,23 @@ export class ProactiveChatService extends Service {
             const score = this._activityScorer.calculateScore(timestamps, state)
             state.lastActivityScore = score
 
-            this._logger.debug(`[evaluateTriggers] ${conversationId}: activityScore=${score.toFixed(3)} threshold=${state.currentThreshold.toFixed(3)}`)
+            this._debug(`[evaluateTriggers] ${conversationId}: activityScore=${score.toFixed(3)} threshold=${state.currentThreshold.toFixed(3)}`)
 
             if (this._activityScorer.shouldTrigger(score, state.currentThreshold)) {
                 const trigger = {
                     type: 'activity' as const,
-                    reason: '活跃度触发'
-                }
-                if (this._config.debugLog) {
-                    this._logger.info(
-                        `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason} activityScore=${score.toFixed(3)} threshold=${state.currentThreshold.toFixed(3)}`
-                    )
+                    reason: '活跃度触发',
+                    debugDetail: `activityScore=${score.toFixed(3)} threshold=${state.currentThreshold.toFixed(3)}`
                 }
                 return trigger
             }
 
             const messageInterval = profile.activityMessageInterval ?? 20
             if (messageInterval > 0 && state.messageCount >= messageInterval) {
-                this._logger.debug(`[evaluateTriggers] ${conversationId}: messageInterval reached (${state.messageCount}/${messageInterval})`)
                 const trigger = {
                     type: 'activity' as const,
-                    reason: '消息计数触发'
-                }
-                if (this._config.debugLog) {
-                    this._logger.info(
-                        `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason} messageCount=${state.messageCount} messageInterval=${messageInterval}`
-                    )
+                    reason: '消息计数触发',
+                    debugDetail: `messageCount=${state.messageCount} messageInterval=${messageInterval}`
                 }
                 return trigger
             }
@@ -554,7 +533,7 @@ export class ProactiveChatService extends Service {
                 }
             }
 
-            this._logger.info(`开始执行主动触发响应，conversationId=${conversationId}，reason=${trigger.reason}`)
+            this._debug(`开始执行主动触发响应，conversationId=${conversationId}，reason=${trigger.reason}`)
 
             if (this._config.verboseLog) {
                 const verboseSnapshot = {
@@ -599,6 +578,12 @@ export class ProactiveChatService extends Service {
                 '',
                 commandOptions
             )
+
+            if (this._config.debugLog) {
+                this._logger.info(
+                    `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason}${trigger.idleMinutes != null ? ` idleMinutes=${trigger.idleMinutes}` : ''}${trigger.debugDetail ? ` ${trigger.debugDetail}` : ''}`
+                )
+            }
 
             this._chatMessages[conversationId] = []
             state.lastFailureTime = 0
@@ -1015,6 +1000,10 @@ export class ProactiveChatService extends Service {
     ) {
         if (!this._config.verboseLog) return
 
+        // 仅对已开启主动发言（活跃度触发或空闲触发）的会话输出判断日志。
+        // 未配置或未开启主动发言的群聊/私聊一律静默，避免对无关会话的每条消息都刷日志造成阻塞。
+        if (!(payload.activityEnabled || payload.idleEnabled)) return
+
         const activityPart = `activity={enabled:${payload.activityEnabled},score:${payload.activityScore == null ? 'n/a' : payload.activityScore.toFixed(3)},threshold:${payload.activityThreshold == null ? 'n/a' : payload.activityThreshold.toFixed(3)},messageCount:${payload.messageCount},messageInterval:${payload.messageInterval ?? 'n/a'},triggered:${payload.activityTriggered}}`
         const idlePart = `idle={enabled:${payload.idleEnabled},idleMinutes:${payload.idleMinutes.toFixed(2)},intervalMinutes:${payload.idleIntervalMinutes ?? 'n/a'},eligible:${payload.idleEligible}}`
         const guaranteedPart = `guaranteed={enabled:${payload.guaranteedEnabled},minutes:${payload.guaranteedMinutes ?? 'n/a'},baseType:${payload.guaranteedBaseType},baseTime:${payload.guaranteedBaseTime},firstEligibleMessageTime:${payload.guaranteedFirstEligibleMessageTime},lastTriggerTime:${payload.guaranteedLastTriggerTime},lastEligibleMessageTime:${payload.guaranteedLastEligibleMessageTime},elapsedSeconds:${payload.guaranteedElapsedSeconds ?? 'n/a'},remainingSeconds:${payload.guaranteedRemainingSeconds ?? 'n/a'},hasEligibleMessage:${payload.guaranteedHasEligibleMessage},eligible:${payload.guaranteedEligible}}`
@@ -1331,7 +1320,7 @@ export class ProactiveChatService extends Service {
         const imageUrls = this._pickImageUrls(session)
 
         if ((profile?.maxRequestImages ?? 3) <= 0 && imageUrls.length > 0) {
-            this._logger.debug(
+            this._debug(
                 `[addChatMessage] skip image message because maxRequestImages=0, conversationId=${conversationId}, imageCount=${imageUrls.length}, proactiveEligible=false`
             )
             return false
@@ -1793,5 +1782,14 @@ export class ProactiveChatService extends Service {
 
     private _isGroupProfile(profile: TriggerProfileConfig | null): profile is GroupTriggerConfig {
         return !!profile && 'enableActivityTrigger' in profile
+    }
+
+    /**
+     * 详细判断日志（每条消息/每次调度的中间判断）。
+     * 仅当 verboseLog 开启时输出，默认日志模式下完全静默，避免对活跃群刷日志造成阻塞。
+     */
+    private _debug(message: string): void {
+        if (!this._config.verboseLog) return
+        this._logger.info(message)
     }
 }

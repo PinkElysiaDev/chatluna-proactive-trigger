@@ -13,7 +13,8 @@ export const usage = `
 - enableActivityTrigger 用于群聊活跃度触发；enableIdleTrigger 用于群聊或私聊空闲触发。
 - historyMessageLimit 控制历史池容量与单次注入上限；cooldownSeconds 控制触发冷却。
 - enableQuoteReplyByMessageId 只控制是否向群聊活跃度历史中注入 message_id，不再自动追加提示词说明。
-- verboseLog 会为每条消息输出综合判断日志，排障时开启即可。
+- verboseLog 会为每条消息输出综合判断日志，排障时开启即可。仅对已开启主动发言（活跃度触发或空闲触发）的会话输出，未配置或未开启主动发言的群聊/私聊静默处理，避免无关会话刷日志造成阻塞。
+- 日志分级：默认（debugLog 与 verboseLog 均关闭）完全不输出任何消息判断日志；开启 debugLog 时仅在主动触发成功后输出触发原因；开启 verboseLog 时输出每条消息的综合判断日志与完整触发请求内容。即默认日志模式下只在成功触发时输出一条判断日志。
 
 关键行为：
 - 活跃度触发生效时会为参与消息积累的用户按需补建 chatluna room，触发执行仍使用最后发言者的 room。
@@ -25,15 +26,8 @@ export const usage = `
 模板变量：
 - {history} {time} {date} {group_name} {user_name} {idle_minutes}
 
-### 0.3.1 & 0.3.2 & 0.3.3 & 0.3.4 & 0.3.5 & 0.3.6 & 0.3.7 & 0.3.8 版本更新内容:
-- 新增触发冷却和最大重试次数功能。
-- 新增群聊活跃度保底触发功能（guaranteedTriggerMinutes）。
-- 修复设计行为外的误触发现象。
-- 增添时间保底触发功能的 debug 日志。
-- 修复首次未发生活跃度触发时，保底触发无法生效的问题。
-- 修复时间保底触发未按期望工作的 bug 。
-- 修复主动触发携带本地缓存图片时，chatluna 将本地路径当作 URL 导致 Invalid URL 的问题。
-- 修复设计行为外的空消息现象。
+### 0.3.10 版本更新内容:
+- 修复日志刷屏导致设备阻塞的严重性能问题：默认日志模式下完全不输出消息判断日志，仅在成功触发时输出一条触发原因（debugLog）；未配置或未开启主动发言的群聊/私聊静默处理（verboseLog）。
 
 ### 请注意：本插件暂不兼容 chatluna 1.4.x版本
 `
