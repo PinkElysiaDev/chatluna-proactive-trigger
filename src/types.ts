@@ -16,6 +16,8 @@ export interface ChatMessage {
     timestamp: number
     messageId?: string
     imgs?: CachedImageRef[]
+    // 是否为直接触发 ChatLuna 的消息（用于保底触发时过滤）
+    isDirectTrigger?: boolean
 }
 
 /**
@@ -37,8 +39,12 @@ export interface ConversationState {
     // 上次活跃度分数
     lastActivityScore: number
 
-    // 上次触发时间
+    // 上次触发时间（任何类型的主动触发，包括活跃度/保底/空闲）
     lastTriggerTime: number
+
+    // 上次主动发言时间（仅限 proactive 触发产生的发言，不含用户直接触发 ChatLuna 的时刻）
+    // 用于保底触发计时基准，保底计时不受用户直接触发影响
+    lastProactiveTriggerTime: number
 
     // 最近一次失败时间
     lastFailureTime: number

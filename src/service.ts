@@ -47,6 +47,7 @@ interface PendingAfterChatAction {
     guildId?: string
     participantUserIds?: string[]
     resetRoomId?: number
+    isProactiveTrigger?: boolean
 }
 
 export class ProactiveChatService extends Service {
@@ -111,20 +112,28 @@ export class ProactiveChatService extends Service {
                 }
             }
 
-            const guildId = await this._resolveGuildIdByRoomConversationId(conversationId)
-            if (guildId) {
-                const pluginConversationId = `group:${guildId}`
-                if (this._chatMessages[pluginConversationId]?.length) {
-                    this._chatMessages[pluginConversationId] = []
-                    await this._clearConversationImageCache(pluginConversationId)
-                    this._markDirty()
+            // 仅在主动触发的 after-chat 中清空消息历史
+            // 用户直接触发 ChatLuna 时不清空，以便保底触发能收集到这些消息
+            if (action?.isProactiveTrigger) {
+                const guildId = await this._resolveGuildIdByRoomConversationId(conversationId)
+                if (guildId) {
+                    const pluginConversationId = `group:${guildId}`
+                    if (this._chatMessages[pluginConversationId]?.length) {
+                        this._chatMessages[pluginConversationId] = []
+                        await this._clearConversationImageCache(pluginConversationId)
+                        this._markDirty()
+                        this._debug(
+                            `[after-chat][reset-group-history] conversationId=${conversationId} groupId=${guildId} reset=true (proactive trigger)`
+                        )
+                    }
+                } else {
                     this._debug(
-                        `[after-chat][reset-group-history] conversationId=${conversationId} groupId=${guildId} reset=true`
+                        `[after-chat][reset-group-history] conversationId=${conversationId} groupId=unknown skip`
                     )
                 }
             } else {
                 this._debug(
-                    `[after-chat][reset-group-history] conversationId=${conversationId} groupId=unknown skip`
+                    `[after-chat][skip-reset] conversationId=${conversationId} reason=not proactive trigger, preserving history for guaranteed trigger`
                 )
             }
         })
@@ -213,6 +222,13 @@ export class ProactiveChatService extends Service {
         state.retryDisabled = false
 
         if (isDirectChatlunaTrigger) {
+            // 仅当本条消息确实写入了历史时才标记，避免误标上一条
+            if (shouldCountForProactive) {
+                const msgs = this._chatMessages[conversationId]
+                if (msgs?.length) {
+                    msgs[msgs.length - 1].isDirectTrigger = true
+                }
+            }
             this._markDirty()
             this._debug(
                 `[handleMessage] ${conversationId}: direct ChatLuna trigger detected, skipped proactive eligibility`
@@ -254,15 +270,16 @@ export class ProactiveChatService extends Service {
         const guaranteedMinutes = guaranteedEnabled && this._isGroupProfile(profile)
             ? profile.guaranteedTriggerMinutes ?? 0
             : null
+        const lastProactive = state.lastProactiveTriggerTime ?? 0
         const guaranteedBaseType = guaranteedEnabled
-            ? state.lastTriggerTime > 0
-                ? 'last-trigger'
+            ? lastProactive > 0
+                ? 'last-proactive-trigger'
                 : state.firstProactiveEligibleMessageTime > 0
                     ? 'first-eligible-message'
                     : 'none'
             : 'none'
-        const guaranteedBaseTime = guaranteedBaseType === 'last-trigger'
-            ? state.lastTriggerTime
+        const guaranteedBaseTime = guaranteedBaseType === 'last-proactive-trigger'
+            ? lastProactive
             : guaranteedBaseType === 'first-eligible-message'
                 ? state.firstProactiveEligibleMessageTime
                 : 0
@@ -273,8 +290,8 @@ export class ProactiveChatService extends Service {
             ? Math.max(0, Math.ceil((guaranteedMinutes * 60 * 1000 - (now - guaranteedBaseTime)) / 1000))
             : null
         const guaranteedHasEligibleMessage = guaranteedEnabled
-            ? state.lastTriggerTime > 0
-                ? (state.lastProactiveEligibleMessageTime ?? 0) > state.lastTriggerTime && (state.messageCount ?? 0) > 0
+            ? lastProactive > 0
+                ? (state.lastProactiveEligibleMessageTime ?? 0) > lastProactive && (state.messageCount ?? 0) > 0
                 : (state.firstProactiveEligibleMessageTime ?? 0) > 0 && (state.messageCount ?? 0) > 0
             : false
         const guaranteedEligible = guaranteedEnabled &&
@@ -302,7 +319,7 @@ export class ProactiveChatService extends Service {
             guaranteedBaseType,
             guaranteedBaseTime,
             guaranteedFirstEligibleMessageTime: state.firstProactiveEligibleMessageTime ?? 0,
-            guaranteedLastTriggerTime: state.lastTriggerTime,
+            guaranteedLastTriggerTime: lastProactive,
             guaranteedLastEligibleMessageTime: state.lastProactiveEligibleMessageTime ?? 0,
             guaranteedElapsedSeconds,
             guaranteedRemainingSeconds,
@@ -381,35 +398,37 @@ export class ProactiveChatService extends Service {
             }
 
             // 保底触发检查：
-            // 距上次活跃度触发超过配置的时间阈值，且上次触发后确实有新消息进入本轮活跃度积累周期。
-            // 若上次触发后完全无消息，则应交给 idle trigger 处理，不由活跃度保底触发兜底。
+            // 距上次主动发言超过配置的时间阈值，且上次主动发言后确实有新消息进入本轮活跃度积累周期。
+            // 保底计时不受用户直接触发 chatluna 的影响，只基于主动发言时间。
+            // 若上次主动发言后完全无消息，则应交给 idle trigger 处理，不由活跃度保底触发兜底。
             if (this._isGroupProfile(profile) && profile.enableActivityTrigger && (profile.guaranteedTriggerMinutes ?? 0) > 0) {
-                const guaranteedBaseType = state.lastTriggerTime > 0
-                    ? 'last-trigger'
+                const lastProactive = state.lastProactiveTriggerTime ?? 0
+                const guaranteedBaseType = lastProactive > 0
+                    ? 'last-proactive-trigger'
                     : state.firstProactiveEligibleMessageTime > 0
                         ? 'first-eligible-message'
                         : 'none'
-                const guaranteedBaseTime = guaranteedBaseType === 'last-trigger'
-                    ? state.lastTriggerTime
+                const guaranteedBaseTime = guaranteedBaseType === 'last-proactive-trigger'
+                    ? lastProactive
                     : guaranteedBaseType === 'first-eligible-message'
                         ? state.firstProactiveEligibleMessageTime
                         : 0
 
                 if (guaranteedBaseTime <= 0) {
                     this._debug(
-                        `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no base time, guaranteedMinutes=${profile.guaranteedTriggerMinutes}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastTriggerTime=${state.lastTriggerTime}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
+                        `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no base time, guaranteedMinutes=${profile.guaranteedTriggerMinutes}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastProactiveTriggerTime=${lastProactive}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
                     )
                     continue
                 }
 
                 const hasEligibleMessageForGuaranteed =
-                    state.lastTriggerTime > 0
-                        ? (state.lastProactiveEligibleMessageTime ?? 0) > state.lastTriggerTime && (state.messageCount ?? 0) > 0
+                    lastProactive > 0
+                        ? (state.lastProactiveEligibleMessageTime ?? 0) > lastProactive && (state.messageCount ?? 0) > 0
                         : (state.firstProactiveEligibleMessageTime ?? 0) > 0 && (state.messageCount ?? 0) > 0
 
                 if (!hasEligibleMessageForGuaranteed) {
                     this._debug(
-                        `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no proactive-eligible message for current guaranteed cycle, baseType=${guaranteedBaseType}, baseTime=${guaranteedBaseTime}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastTriggerTime=${state.lastTriggerTime}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
+                        `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no proactive-eligible message for current guaranteed cycle, baseType=${guaranteedBaseType}, baseTime=${guaranteedBaseTime}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastProactiveTriggerTime=${lastProactive}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
                     )
                     continue
                 }
@@ -419,7 +438,7 @@ export class ProactiveChatService extends Service {
                 const guaranteedRemainingMs = guaranteedMs - elapsedSinceGuaranteedBase
                 if (elapsedSinceGuaranteedBase < guaranteedMs) {
                     this._debug(
-                        `[schedulerTick] ${conversationId}: guaranteed trigger waiting, baseType=${guaranteedBaseType}, elapsed=${Math.floor(elapsedSinceGuaranteedBase / 1000)}s, remaining=${Math.ceil(guaranteedRemainingMs / 1000)}s, threshold=${profile.guaranteedTriggerMinutes}min, baseTime=${guaranteedBaseTime}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastTriggerTime=${state.lastTriggerTime}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
+                        `[schedulerTick] ${conversationId}: guaranteed trigger waiting, baseType=${guaranteedBaseType}, elapsed=${Math.floor(elapsedSinceGuaranteedBase / 1000)}s, remaining=${Math.ceil(guaranteedRemainingMs / 1000)}s, threshold=${profile.guaranteedTriggerMinutes}min, baseTime=${guaranteedBaseTime}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastProactiveTriggerTime=${lastProactive}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
                     )
                     continue
                 }
@@ -427,8 +446,8 @@ export class ProactiveChatService extends Service {
                 if (elapsedSinceGuaranteedBase >= guaranteedMs) {
                     const trigger: TriggerReason = {
                         type: 'activity',
-                        reason: '保底触发（距上次活跃度触发超时）',
-                        debugDetail: `guaranteedBaseType=${guaranteedBaseType} secondsSinceGuaranteedBase=${Math.floor(elapsedSinceGuaranteedBase / 1000)} guaranteedMinutes=${profile.guaranteedTriggerMinutes} baseTime=${guaranteedBaseTime} firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0} lastTriggerTime=${state.lastTriggerTime} lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0} messageCount=${state.messageCount}`
+                        reason: '保底触发（距上次主动发言超时）',
+                        debugDetail: `guaranteedBaseType=${guaranteedBaseType} secondsSinceGuaranteedBase=${Math.floor(elapsedSinceGuaranteedBase / 1000)} guaranteedMinutes=${profile.guaranteedTriggerMinutes} baseTime=${guaranteedBaseTime} firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0} lastProactiveTriggerTime=${lastProactive} lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0} messageCount=${state.messageCount}`
                     }
                     await this._triggerResponse(session, trigger, profile)
                     this._markDirty()
@@ -497,7 +516,16 @@ export class ProactiveChatService extends Service {
         try {
             const template = this._getPromptTemplate(trigger, profile)
             const useHist = this._shouldUseHistory(template)
-            const msgs = useHist ? this._getRecentHistoryMessages(conversationId, profile) : []
+            const isGuaranteedTrigger = trigger.reason.startsWith('保底触发')
+            const msgs = useHist
+                ? this._getRecentHistoryMessages(conversationId, profile, {
+                    // 保底触发：取自上次主动发言后的消息，并忽略直接触发 ChatLuna 的消息
+                    sinceTimestamp: isGuaranteedTrigger
+                        ? (state.lastProactiveTriggerTime || 0)
+                        : 0,
+                    excludeDirectTriggers: isGuaranteedTrigger
+                })
+                : []
             const execution = await this._resolveExecutionContext(session, trigger, msgs)
             if (!execution?.room) {
                 this._logger.warn(
@@ -519,7 +547,11 @@ export class ProactiveChatService extends Service {
             }
 
             if (room.conversationId) {
-                const pendingAction: PendingAfterChatAction = {}
+                const pendingAction: PendingAfterChatAction = {
+                    // 标记为主动触发，after-chat 仅在此情况下清空消息缓存
+                    // 用户直接触发 ChatLuna 时不会写入此标记，从而保留消息供保底触发使用
+                    isProactiveTrigger: true
+                }
                 if (!session.isDirect && trigger.type === 'activity') {
                     pendingAction.guildId = session.guildId
                     pendingAction.participantUserIds = this._collectParticipantUserIds(msgs)
@@ -527,10 +559,9 @@ export class ProactiveChatService extends Service {
                 if (resetAfterChat) {
                     pendingAction.resetRoomId = room.roomId
                 }
-                if (pendingAction.guildId || pendingAction.resetRoomId != null) {
-                    pendingConversationId = room.conversationId
-                    this._pendingBroadcast.set(room.conversationId, pendingAction)
-                }
+                // 始终注册 pending，确保 after-chat 能识别主动触发并正确清理历史
+                pendingConversationId = room.conversationId
+                this._pendingBroadcast.set(room.conversationId, pendingAction)
             }
 
             this._debug(`开始执行主动触发响应，conversationId=${conversationId}，reason=${trigger.reason}`)
@@ -1006,7 +1037,7 @@ export class ProactiveChatService extends Service {
 
         const activityPart = `activity={enabled:${payload.activityEnabled},score:${payload.activityScore == null ? 'n/a' : payload.activityScore.toFixed(3)},threshold:${payload.activityThreshold == null ? 'n/a' : payload.activityThreshold.toFixed(3)},messageCount:${payload.messageCount},messageInterval:${payload.messageInterval ?? 'n/a'},triggered:${payload.activityTriggered}}`
         const idlePart = `idle={enabled:${payload.idleEnabled},idleMinutes:${payload.idleMinutes.toFixed(2)},intervalMinutes:${payload.idleIntervalMinutes ?? 'n/a'},eligible:${payload.idleEligible}}`
-        const guaranteedPart = `guaranteed={enabled:${payload.guaranteedEnabled},minutes:${payload.guaranteedMinutes ?? 'n/a'},baseType:${payload.guaranteedBaseType},baseTime:${payload.guaranteedBaseTime},firstEligibleMessageTime:${payload.guaranteedFirstEligibleMessageTime},lastTriggerTime:${payload.guaranteedLastTriggerTime},lastEligibleMessageTime:${payload.guaranteedLastEligibleMessageTime},elapsedSeconds:${payload.guaranteedElapsedSeconds ?? 'n/a'},remainingSeconds:${payload.guaranteedRemainingSeconds ?? 'n/a'},hasEligibleMessage:${payload.guaranteedHasEligibleMessage},eligible:${payload.guaranteedEligible}}`
+        const guaranteedPart = `guaranteed={enabled:${payload.guaranteedEnabled},minutes:${payload.guaranteedMinutes ?? 'n/a'},baseType:${payload.guaranteedBaseType},baseTime:${payload.guaranteedBaseTime},firstEligibleMessageTime:${payload.guaranteedFirstEligibleMessageTime},lastProactiveTriggerTime:${payload.guaranteedLastTriggerTime},lastEligibleMessageTime:${payload.guaranteedLastEligibleMessageTime},elapsedSeconds:${payload.guaranteedElapsedSeconds ?? 'n/a'},remainingSeconds:${payload.guaranteedRemainingSeconds ?? 'n/a'},hasEligibleMessage:${payload.guaranteedHasEligibleMessage},eligible:${payload.guaranteedEligible}}`
 
         this._logger.info(
             `[verboseLog][message-eval] conversationId=${payload.conversationId} guildId=${session.guildId ?? ''} userId=${session.userId ?? ''} isDirect=${session.isDirect} profile=${payload.profileType} cooldownRemainingMs=${payload.cooldownRemainingMs} responseLocked=${payload.responseLocked} ${activityPart} ${idlePart} ${guaranteedPart} finalDecision=${payload.finalDecision}${payload.triggerReason ? ` reason="${payload.triggerReason}"` : ''}`
@@ -1129,6 +1160,7 @@ export class ProactiveChatService extends Service {
     private _updateStateAfterResponse(state: ConversationState, profile: TriggerProfileConfig): void {
         const now = Date.now()
         state.lastTriggerTime = now
+        state.lastProactiveTriggerTime = now
         state.firstProactiveEligibleMessageTime = 0
         state.messageCount = 0
         if (this._isGroupProfile(profile) && profile.enableActivityTrigger) {
@@ -1246,6 +1278,7 @@ export class ProactiveChatService extends Service {
                     : 1,
                 lastActivityScore: 0,
                 lastTriggerTime: 0,
+                lastProactiveTriggerTime: 0,
                 lastFailureTime: 0,
                 failureCount: 0,
                 retryDisabled: false,
@@ -1598,10 +1631,29 @@ export class ProactiveChatService extends Service {
         }
     }
 
-    private _getRecentHistoryMessages(conversationId: string, profile: TriggerProfileConfig): ChatMessage[] {
+    private _getRecentHistoryMessages(
+        conversationId: string,
+        profile: TriggerProfileConfig,
+        options?: {
+            sinceTimestamp?: number
+            excludeDirectTriggers?: boolean
+        }
+    ): ChatMessage[] {
         const messages = this._chatMessages[conversationId]
         if (!messages || messages.length === 0) return []
-        return messages.slice(-profile.historyMessageLimit)
+
+        const sinceTimestamp = options?.sinceTimestamp ?? 0
+        const excludeDirectTriggers = options?.excludeDirectTriggers ?? false
+
+        let filtered = messages
+        if (sinceTimestamp > 0) {
+            filtered = filtered.filter(msg => msg.timestamp > sinceTimestamp)
+        }
+        if (excludeDirectTriggers) {
+            filtered = filtered.filter(msg => !msg.isDirectTrigger)
+        }
+
+        return filtered.slice(-profile.historyMessageLimit)
     }
 
     private _formatTimestamp(timestamp: number): string {
@@ -1694,6 +1746,7 @@ export class ProactiveChatService extends Service {
                 ),
                 lastActivityScore: Number(state.lastActivityScore) || 0,
                 lastTriggerTime: Number(state.lastTriggerTime) || 0,
+                lastProactiveTriggerTime: Number((state as Partial<ConversationState>).lastProactiveTriggerTime) || 0,
                 lastFailureTime: Number((state as Partial<ConversationState>).lastFailureTime) || 0,
                 failureCount: Number((state as Partial<ConversationState>).failureCount) || 0,
                 retryDisabled: Boolean((state as Partial<ConversationState>).retryDisabled),
@@ -1772,7 +1825,8 @@ export class ProactiveChatService extends Service {
                         content: this._normalizeMessageContent(String(msg.content ?? ''), imgs),
                         timestamp: Number(msg.timestamp) || Date.now(),
                         messageId: msg.messageId == null ? undefined : String(msg.messageId),
-                        imgs
+                        imgs,
+                        ...(msg.isDirectTrigger ? { isDirectTrigger: true } : {})
                     }
                 })
                 .slice(-Math.max(1, this._getProfileByConversationId(conversationId)?.historyMessageLimit || this.MAX_MESSAGES))
