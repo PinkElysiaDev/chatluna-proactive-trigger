@@ -148,7 +148,7 @@ export class ProactiveChatService extends Service {
         this._persistenceDisposable = this.ctx.setInterval(() => {
             this._saveState()
         }, 10000)
-        this._logger.info('ProactiveChatService 已启动')
+        this._logInfo('ProactiveChatService 已启动')
     }
 
     async stop(): Promise<void> {
@@ -161,7 +161,7 @@ export class ProactiveChatService extends Service {
             this._persistenceDisposable = null
         }
         await this._saveState(true)
-        this._logger.info('ProactiveChatService 已停止')
+        this._logInfo('ProactiveChatService 已停止')
     }
 
     async handleMessage(session: Session, next: Next): Promise<void> {
@@ -519,16 +519,18 @@ export class ProactiveChatService extends Service {
             const isGuaranteedTrigger = trigger.reason.startsWith('保底触发')
             const msgs = useHist
                 ? this._getRecentHistoryMessages(conversationId, profile, {
-                    // 保底触发：取自上次主动发言后的消息，并忽略直接触发 ChatLuna 的消息
+                    // 主动发言一律排除"用户直接触发 ChatLuna"的消息（@bot / 引用 bot / 喊 bot 名字）：
+                    // 这些消息已由 chatluna 常规流程回复，注入会导致 LLM 重复作答。
+                    // 保底触发额外限定 sinceTimestamp 为上次主动发言后；常规触发取全部缓存。
                     sinceTimestamp: isGuaranteedTrigger
                         ? (state.lastProactiveTriggerTime || 0)
                         : 0,
-                    excludeDirectTriggers: isGuaranteedTrigger
+                    excludeDirectTriggers: true
                 })
                 : []
             const execution = await this._resolveExecutionContext(session, trigger, msgs)
             if (!execution?.room) {
-                this._logger.warn(
+                this._logInfo(
                     `[triggerResponse] 未能解析执行 room，conversationId=${conversationId}, triggerType=${trigger.type}, userId=${session.userId}, guildId=${session.guildId}`
                 )
                 return
@@ -610,7 +612,7 @@ export class ProactiveChatService extends Service {
                 commandOptions
             )
 
-            if (this._config.debugLog) {
+            if (this._config.debugLog || this._config.verboseLog) {
                 this._logger.info(
                     `[debugLog][trigger] conversationId=${conversationId} type=${trigger.type} reason=${trigger.reason}${trigger.idleMinutes != null ? ` idleMinutes=${trigger.idleMinutes}` : ''}${trigger.debugDetail ? ` ${trigger.debugDetail}` : ''}`
                 )
@@ -665,7 +667,7 @@ export class ProactiveChatService extends Service {
                     rooms.push(room)
                 }
             } catch (e) {
-                this._logger.warn(`Failed to ensure participant room for user ${userId} in guild ${guildId}: ${e}`)
+                this._logInfo(`Failed to ensure participant room for user ${userId} in guild ${guildId}: ${e}`)
             }
         }
 
@@ -675,7 +677,7 @@ export class ProactiveChatService extends Service {
 
         if (uniqueRooms.length === 0) return
 
-        this._logger.debug(`Syncing proactive message to ${uniqueRooms.length} participant rooms in guild ${guildId}`)
+        this._debug(`Syncing proactive message to ${uniqueRooms.length} participant rooms in guild ${guildId}`)
 
         for (const room of uniqueRooms) {
             try {
@@ -683,7 +685,7 @@ export class ProactiveChatService extends Service {
                 await history.loadConversation()
                 await history.addMessage(aiMessage as any)
             } catch (e) {
-                this._logger.warn(`Failed to sync to participant room ${room.roomId} (${room.conversationId}): ${e}`)
+                this._logInfo(`Failed to sync to participant room ${room.roomId} (${room.conversationId}): ${e}`)
             }
         }
     }
@@ -696,7 +698,7 @@ export class ProactiveChatService extends Service {
         if (trigger.type === 'idle' && !session.isDirect) {
             const room = await this._ensureProactiveRoomForGuild(session)
             if (room) {
-                this._logger.info(
+                this._logInfo(
                     `[resolveExecutionContext] idle resolved proactive room, guildId=${session.guildId}, roomId=${room.roomId}, conversationId=${room.conversationId}`
                 )
                 return {
@@ -725,7 +727,7 @@ export class ProactiveChatService extends Service {
 
             const room = await this._ensureUserRoomForGroup(session.userId, session.guildId)
             if (room) {
-                this._logger.info(
+                this._logInfo(
                     `[resolveExecutionContext] 活跃度触发已解析用户 room，guildId=${session.guildId}, userId=${session.userId}, roomId=${room.roomId}, conversationId=${room.conversationId}`
                 )
                 return {
@@ -742,11 +744,11 @@ export class ProactiveChatService extends Service {
 
         const room = await queryJoinedConversationRoom(this.ctx, session)
         if (room) {
-            this._logger.info(
+            this._logInfo(
                 `[resolveExecutionContext] 已命中 joined room 回退路径，guildId=${session.guildId}, userId=${session.userId}, roomId=${room.roomId}, conversationId=${room.conversationId}`
             )
         } else {
-            this._logger.warn(
+            this._logInfo(
                 `[resolveExecutionContext] joined room 回退路径未命中，guildId=${session.guildId}, userId=${session.userId}, isDirect=${session.isDirect}`
             )
         }
@@ -798,7 +800,7 @@ export class ProactiveChatService extends Service {
         }
 
         await createConversationRoom(this.ctx, this._createProactiveSession(session), room as any)
-        this._logger.info(`Provisioned proactive room ${room.roomId} for guild ${guildId}`)
+        this._logInfo(`Provisioned proactive room ${room.roomId} for guild ${guildId}`)
         return room
     }
 
@@ -819,23 +821,23 @@ export class ProactiveChatService extends Service {
         })
 
         if (existingUserRecords.length > 0) {
-            this._logger.info(
+            this._logInfo(
                 `[ensureUserRoomForGroup] found chathub_user record, guildId=${guildId}, userId=${userId}, defaultRoomId=${existingUserRecords[0].defaultRoomId}`
             )
             const existingRoom = await resolveConversationRoom(this.ctx, existingUserRecords[0].defaultRoomId)
             if (existingRoom) {
-                this._logger.info(
+                this._logInfo(
                     `[ensureUserRoomForGroup] 已解析现有 room，guildId=${guildId}, userId=${userId}, roomId=${existingRoom.roomId}, conversationId=${existingRoom.conversationId}`
                 )
                 this._knownUserRooms.add(`${guildId}:${userId}`)
                 return existingRoom as ManagedRoom
             }
 
-            this._logger.warn(
+            this._logInfo(
                 `[ensureUserRoomForGroup] defaultRoomId exists but room missing, guildId=${guildId}, userId=${userId}, defaultRoomId=${existingUserRecords[0].defaultRoomId}`
             )
         } else {
-            this._logger.info(
+            this._logInfo(
                 `[ensureUserRoomForGroup] no chathub_user record, guildId=${guildId}, userId=${userId}, provisioning required`
             )
         }
@@ -849,7 +851,7 @@ export class ProactiveChatService extends Service {
             return null
         }
 
-        this._logger.info(
+        this._logInfo(
             `[ensureUserRoomForGroup] 使用模板 room 进行补建，guildId=${guildId}, userId=${userId}, source=${guildTemplateRoom ? 'guild-room' : 'local-template'}, model=${templateRoom.model}, preset=${templateRoom.preset}, chatMode=${templateRoom.chatMode}`
         )
 
@@ -869,7 +871,7 @@ export class ProactiveChatService extends Service {
         try {
             await createConversationRoom(this.ctx, this._createUserRoomSession(guildId, userId), room as any)
             this._knownUserRooms.add(`${guildId}:${userId}`)
-            this._logger.info(`已为用户补建 room，guildId=${guildId}, userId=${userId}, roomId=${room.roomId}`)
+            this._logInfo(`已为用户补建 room，guildId=${guildId}, userId=${userId}, roomId=${room.roomId}`)
             return room
         } catch (error) {
             this._logger.error(
@@ -882,7 +884,7 @@ export class ProactiveChatService extends Service {
     private async _resetRoomHistory(room: ManagedRoom): Promise<void> {
         const chatInterface = this.ctx.chatluna.queryInterfaceWrapper(room as any, false)
         await chatInterface?.clearChatHistory(room as any)
-        this._logger.debug(`Reset proactive room history for roomId=${room.roomId}, conversationId=${room.conversationId}`)
+        this._debug(`Reset proactive room history for roomId=${room.roomId}, conversationId=${room.conversationId}`)
     }
 
     private _buildLocalTemplateRoom(): ManagedRoom | null {
@@ -1625,7 +1627,7 @@ export class ProactiveChatService extends Service {
         try {
             await fs.rm(this._getConversationImageDir(conversationId), { recursive: true, force: true })
         } catch (error) {
-            this._logger.warn(
+            this._logInfo(
                 `[clearConversationImageCache] 清理图片缓存失败，conversationId=${conversationId}, error=${error}`
             )
         }
@@ -1679,9 +1681,9 @@ export class ProactiveChatService extends Service {
             this._conversationStates = this._sanitizeConversationStates(parsed?.conversationStates ?? {})
             this._messageTimestamps = this._sanitizeTimestamps(parsed?.messageTimestamps ?? {})
             this._chatMessages = this._sanitizeChatMessages(parsed?.chatMessages ?? {})
-            this._logger.info(`已加载 proactive 状态文件：${this._stateFilePath}`)
+            this._logInfo(`已加载 proactive 状态文件：${this._stateFilePath}`)
         } catch (error) {
-            this._logger.debug(`未加载到持久化 proactive 状态：${error}`)
+            this._debug(`未加载到持久化 proactive 状态：${error}`)
         }
     }
 
@@ -1836,6 +1838,15 @@ export class ProactiveChatService extends Service {
 
     private _isGroupProfile(profile: TriggerProfileConfig | null): profile is GroupTriggerConfig {
         return !!profile && 'enableActivityTrigger' in profile
+    }
+
+    /**
+     * 基础运营日志（启停、room 补建、状态加载、触发成功原因等）。
+     * 基础日志模式(debugLog)或详细日志模式(verboseLog)开启时输出；默认模式下静默。
+     */
+    private _logInfo(message: string): void {
+        if (!this._config.debugLog && !this._config.verboseLog) return
+        this._logger.info(message)
     }
 
     /**

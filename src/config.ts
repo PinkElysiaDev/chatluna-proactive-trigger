@@ -204,10 +204,10 @@ export const Config = Schema.intersect([
             .description('主动触发连续失败的最大重试次数'),
         debugLog: Schema.boolean()
             .default(false)
-            .description('普通日志模式：仅在主动触发成功后输出触发原因。默认关闭时完全不输出任何消息判断日志'),
+            .description('基础日志模式：输出启停、room 补建、状态加载、主动触发成功原因等运营日志。默认（两档均关）时不输出任何运营/判断日志，仅保留少量真实故障告警'),
         verboseLog: Schema.boolean()
             .default(false)
-            .description('详细日志模式：输出每条消息的综合判断日志与完整的触发请求内容。未配置或未开启主动发言的群聊/私聊静默处理；默认日志模式下完全不输出消息判断日志'),
+            .description('详细日志模式：在基础日志之上，额外输出每条消息的综合判断日志、调度中间判断与完整触发请求快照，用于开发期排查 bug。为基础日志模式的超集；未配置或未开启主动发言的群聊/私聊静默处理'),
     }).description('基础配置'),
 
     // 群聊配置
