@@ -936,18 +936,22 @@ export class ProactiveChatService extends Service {
         // 影子属性覆盖合成身份，原 session 对象保持不变。
         // author 必须是对象而非 undefined：koishi 的 session.username getter 会读
         // this.author.nick，OneBot 等编码器发送时依赖它——置 undefined 会让每条
-        // 主动回复在发送阶段崩溃（TypeError: reading 'nick'）
+        // 主动回复在发送阶段崩溃（TypeError: reading 'nick'）。
+        // 三个影子属性必须不可枚举：satori MessageEncoder.send 会把 options.session
+        // 的可枚举键逐个赋值到新生成的发送会话上，而 author/userId/username 在真实
+        // 会话上由原型 getter（无 setter）或事件派生、不可枚举——若影子属性可枚举，
+        // 拷贝会撞上仅有 getter 的访问器并抛 "Cannot set property author" 导致发送失败
         Object.defineProperty(cloned, 'userId', {
             value: '__proactive_trigger__',
             writable: true,
             configurable: true,
-            enumerable: true
+            enumerable: false
         })
         Object.defineProperty(cloned, 'username', {
             value: 'proactive-trigger',
             writable: true,
             configurable: true,
-            enumerable: true
+            enumerable: false
         })
         Object.defineProperty(cloned, 'author', {
             value: {
@@ -958,7 +962,7 @@ export class ProactiveChatService extends Service {
             },
             writable: true,
             configurable: true,
-            enumerable: true
+            enumerable: false
         })
 
         // 早期哨兵：若未来 koishi/chatluna 再次改变 session 形状，第一时间在日志暴露

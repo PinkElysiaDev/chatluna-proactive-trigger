@@ -26,6 +26,9 @@ export const usage = `
 模板变量：
 - {history} {time} {date} {group_name} {user_name} {idle_minutes}
 
+### 0.3.16 版本更新内容:
+- 修复 0.3.15 中主动回复仍无法发送的问题：合成会话的 userId/username/author 影子属性此前定义为可枚举，而 satori 的 MessageEncoder.send 会把会话的可枚举键逐个拷贝到新生成的发送会话上，author 在真实会话上是仅有 getter 的原型访问器，拷贝赋值即抛出 "Cannot set property author ... which has only a getter" 导致发送崩溃。现改为不可枚举，读取语义不变，键集合与真实会话对齐。
+
 ### 0.3.15 版本更新内容:
 - verboseLog 开启时，调度器跳过/等待分支的日志（in cooldown / responseLocked / guaranteed skipped / guaranteed waiting 等）按"原因变化或 30 秒"去重，修复空闲会话每秒一条的日志刷屏。该日志仍仅在 verboseLog 下输出，生产环境建议保持 verboseLog 关闭。
 - 修复主动回复从未真正发送到群的问题：合成会话的 author 此前被置为 undefined，koishi 的 session.username getter 读取 author.nick 时抛出 TypeError，导致每条主动回复在 OneBot 编码发送阶段崩溃；现改为合成 author 对象。

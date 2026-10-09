@@ -393,6 +393,9 @@ applyDefaultPrivateConfigs:
 
 ## 版本更新日志
 
+### 0.3.16
+- 修复 0.3.15 主动回复仍无法发送：合成会话影子属性（userId/username/author）改为不可枚举，避免 satori MessageEncoder.send 的可枚举键拷贝撞上仅有 getter 的原型访问器（"Cannot set property author"）。
+
 ### 0.3.15
 - verboseLog 下调度器跳过/等待日志按"原因变化或 30 秒"去重，修复空闲会话 1 条/秒的日志刷屏；verboseLog 仍仅建议排障时开启。
 - 修复主动回复从未真正发送到群的问题：合成会话 author 为 undefined 导致 session.username 在 OneBot 发送阶段抛 TypeError；现改为合成 author 对象。
