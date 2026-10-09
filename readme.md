@@ -21,12 +21,10 @@
 - **群级历史池**
   - 群聊历史按群维护，不按 room 维护
   - bot 在该群成功回复后，会重置该群历史池
-- **room 自动补建**
-  - 参与活跃度消息积累的群成员会按需补建 chatluna room
-  - activity 触发执行时仍使用最后发言者的 room
-- **参与者级同步**
-  - 主动发言后的历史同步只面向本轮参与者
-  - 不再向群内所有 room 扩散
+- **每群一个 proactive room**
+  - 群聊的所有主动触发统一在每群专属的 proactive room 中执行
+  - 不再随最后发言者轮转用户 room，也不再为用户补建 room
+  - 每次触发后清空该 room 的 chatluna 历史，上下文依赖 `{history}` 模板注入
 - **图片本地缓存**
   - 每轮群级历史池内的图片会缓存到本地
   - 历史文本中的图片标记使用 `[图片:hash]`
@@ -49,7 +47,7 @@ npm install koishi-plugin-chatluna-proactive-trigger
 
 - `koishi ^4.18.7`
 - `koishi-plugin-chatluna ^1.0.0`
-- 数据库服务（用于 room 查询、补建与历史同步）
+- 数据库服务（用于 proactive room 的创建与查询）
 
 如果你希望模型输出：
 
@@ -115,36 +113,20 @@ group:${guildId}
 
 ---
 
-## 4. room 自动补建
+## 4. 每群一个 proactive room
 
-在群聊中，只要某位用户的消息被纳入活跃度历史池，插件就会按需确保：
+群聊的所有主动触发（活跃度/保底/空闲）统一锚定到**每个群一个专属 room**：
 
-- 该用户在当前群下存在对应 chatluna room
-- 后续 activity 触发、参与者同步和历史写入都能正常进行
+- room 由合成用户 `__proactive_trigger__` 持有，群内第一次触发时自动创建
+- 触发请求通过该合成用户的会话发出，chatluna 按 `chathub_user` 记录解析到该 room
+- **每次触发后清空该 room 的 chatluna 对话历史**：群聊上下文由 `{history}` 模板注入，chatluna 侧不保留 bot 主动发言的记忆
+- 私聊触发仍使用该用户已加入的 room
 
-### 执行 room 规则
-activity 触发时：
-- 固定使用**最后发言者**的 room
-- 如果最后发言者没有 room，会先尝试补建，再执行触发
-
----
-
-## 5. 主动发言后的同步范围
-
-主动发言成功后：
-
-- **只同步给本轮参与者**
-- 不再同步给群内所有用户
-
-这可以减少：
-- 无关 room 的上下文污染
-- 每用户独立 room 场景下的语义错位
-
-> 注意：`syncToAllRooms` 这个历史命名仍保留在配置中，但当前行为语义更接近“启用参与者同步”。
+> 该设计同时是内存安全考量：chatluna ≤1.3.34 会为每个被 chat 过的 conversationId 创建 ChatInterface 且永不释放（root 上下文监听 + LRU 淘汰不释放）。若 room 随最后发言者轮转，泄漏实例数会达到 O(用户数) 且历史被同步机制无限灌大；锚定每群一个 room 并每次清空历史后，泄漏面收敛为 O(群数)、单实例尺寸有界。
 
 ---
 
-## 6. 图片缓存与图片标记
+## 5. 图片缓存与图片标记
 
 为避免 QQ 图片 URL 在长时间后失效，本插件会：
 
@@ -178,7 +160,8 @@ activity 触发时：
 |--------|------|
 | `applyDefaultGroupConfigs` | 应用默认群聊配置模板的群号列表 |
 | `applyDefaultPrivateConfigs` | 应用默认私聊配置模板的用户列表 |
-| `syncToAllRooms` | 启用主动发言后的参与者历史同步 |
+| `failureCooldownSeconds` | 主动触发失败后的会话冷却时间（秒） |
+| `maxRetryAttempts` | 主动触发连续失败的最大重试次数 |
 | `debugLog` | 输出触发原因等普通调试日志 |
 | `verboseLog` | 输出每条消息的综合判断日志与完整请求快照 |
 
@@ -376,11 +359,12 @@ applyDefaultPrivateConfigs:
 
 ---
 
-## 为什么有些用户会自动获得 chatluna room？
-因为参与群聊活跃度消息积累的用户会按需补建 room。  
-这是为了保证：
-- activity 触发时最后发言者一定能有执行 room
-- 主动发言后的参与者同步也能正常工作
+## 为什么不再为用户自动补建 chatluna room？
+
+0.3.13 起移除了该机制。原因：
+- chatluna 核心为每个被 chat 过的 conversationId 创建的 ChatInterface 永不释放，按用户补建/轮转 room 会让泄漏实例数随用户数无界增长
+- 群聊触发已统一锚定每群一个 proactive room，用户 room 不再参与主动发言流程
+- 存量部署中历史版本创建的用户 room 不会被自动清理，如需可手动删除（room 名以 `Proactive User Room` 开头）
 
 ---
 
@@ -408,6 +392,29 @@ applyDefaultPrivateConfigs:
 ---
 
 ## 版本更新日志
+
+### 0.3.15
+- verboseLog 下调度器跳过/等待日志按"原因变化或 30 秒"去重，修复空闲会话 1 条/秒的日志刷屏；verboseLog 仍仅建议排障时开启。
+- 修复主动回复从未真正发送到群的问题：合成会话 author 为 undefined 导致 session.username 在 OneBot 发送阶段抛 TypeError；现改为合成 author 对象。
+- 修复 room 历史重置与聊天链的 conversation 队列竞争（慢模型下 180s 超时、该轮历史未清）：改为 after-chat 登记、调度 tick 空闲时异步执行并自动重试。
+
+### 0.3.14
+- 修复 0.3.13 在 koishi 4.18.x + chatluna 1.3.x 生产环境下群聊触发必然失败的问题：
+  - 现象：`TypeError: Cannot read properties of undefined (reading 'atSelf')`（chatluna allow_reply）与 `TypeError: session.text is not a function`。
+  - 根因：koishi 4.18 的 session 实例方法（stripped/text/send 等）经 cordis mixin 的 internal accessor 按接收者分发，0.3.13 的描述符克隆会话丢失该分发路径。
+  - 修复：合成会话改为以原 session 为原型派生（Object.create + 影子属性覆盖 userId/username/author），完整保留方法解析路径；并增加克隆保真哨兵日志。
+
+### 0.3.13
+- **破坏性变更**：移除 `syncToAllRooms` 配置（主动发言历史同步到参与者 room）与用户 room 自动补建机制。
+- **修复长期运行内存持续增长（可达 GB 级）的问题**：chatluna ≤1.3.34 中每个被 chat 过的 conversationId 都会创建一个永不释放的 ChatInterface（构造器在 root 上下文注册 dispose 监听并丢弃 disposer，LRU 淘汰不释放，且整段历史全量驻留）。本插件此前按最后发言者轮转用户 room 并向所有参与者 room 同步历史，使泄漏实例数达 O(用户数)、历史体积无界膨胀。现在群聊触发统一锚定每群一个 proactive room，并在每次触发后清空其历史。
+- after-chat 清理不再反查 `chathub_room_group_member`，直接使用触发时携带的 guildId。
+- 会话状态（消息缓存/时间戳/Session 引用）在配置移除后自动淘汰；状态持久化增加最小序列化间隔（30s）；after-chat pending 动作增加 10 分钟超时清扫。
+- 修复：私聊触发可能误清群聊历史池与图片缓存（部分平台私聊会话携带 guildId）。
+- 修复：群内无任何 chatluna room 时 proactive room 供给必然失败（getTemplateConversationRoom 从本插件调用读到本插件配置并抛 ROOM_TEMPLATE_INVALID）；现改用本地模板构建并在供给失败时回退 joined-room 路径。
+- 修复：proactive room 创建并发时 roomId 主键冲突（增加进程内互斥 + 失败重查）。
+- 修复：图片缓存下载无超时且阻塞消息中间件（15s 超时 + 异步补写 localPath）。
+- 修复：停止插件时最后的强制保存可能被序列化间隔睡眠吞掉（睡眠可唤醒 + 等待在途保存）。
+- 已知残留：chatluna 核心的 ChatInterface 泄漏本身仍存在（正常用户对话同样会缓慢累积），建议向上游反馈修复。
 
 ### 0.3.0
 - 新增消息 id 传递功能，允许用户跳过提示词要求模型引用特定消息回复（需要与 chatluna 主插件 “用 koishi 消息元素渲染”配置项配合使用）

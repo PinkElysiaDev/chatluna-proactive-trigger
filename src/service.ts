@@ -2,18 +2,16 @@ import { Context, Service, Session, Logger, Next, h } from 'koishi'
 import { promises as fs } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { Config, GroupTriggerConfig, TriggerProfileConfig, PrivateTriggerConfig } from './config'
+import { Config, GroupTriggerConfig, TriggerProfileConfig } from './config'
 import { ActivityScorer } from './activity'
 import { IdleScheduler } from './scheduler'
 import { CachedImageRef, ChatMessage, ConversationState, TriggerReason } from './types'
 import {
     createConversationRoom,
     getConversationRoomCount,
-    getTemplateConversationRoom,
     queryJoinedConversationRoom,
     resolveConversationRoom
 } from 'koishi-plugin-chatluna/chains'
-import { KoishiChatMessageHistory } from 'koishi-plugin-chatluna/llm-core/memory/message'
 import type {} from 'koishi-plugin-chatluna/services/chat'
 import type {} from 'koishi-plugin-chatluna/llm-core/chat/app'
 
@@ -45,9 +43,16 @@ interface ManagedRoom {
 
 interface PendingAfterChatAction {
     guildId?: string
-    participantUserIds?: string[]
     resetRoomId?: number
     isProactiveTrigger?: boolean
+    // 创建时间戳，调度 tick 据此清扫 after-chat 未消费的残留条目
+    createdAt: number
+}
+
+interface PendingRoomReset {
+    roomId: number
+    guildId?: string
+    attempts: number
 }
 
 export class ProactiveChatService extends Service {
@@ -64,15 +69,34 @@ export class ProactiveChatService extends Service {
     private _dirty = false
     private _isSaving = false
     private _pendingSave = false
+    private _lastSaveTime = 0
     private _stateFilePath: string
     private _imageCacheDir: string
+    // 保存循环序列化间隔睡眠的唤醒句柄，stop() 用它避免最后的强制保存被睡眠吞掉
+    private _saveWakeUp: (() => void) | null = null
+    // 在途的保存循环 Promise，stop() 等待它完成后再做最终保存
+    private _saveInFlight: Promise<void> | null = null
+    // proactive room 创建段的进程内互斥队列（roomId 按 max+1 分配，需串行化）
+    private _roomCreateQueue: Promise<unknown> = Promise.resolve()
+
+    // 两次全量状态序列化的最小间隔，防止活跃群触发 stringify 热循环
+    private readonly MIN_SAVE_INTERVAL_MS = 30_000
+    // after-chat pending 动作的最大存活时间
+    private readonly PENDING_ACTION_TTL_MS = 10 * 60 * 1000
+    // 调度器跳过/等待日志的去重间隔
+    private readonly TICK_LOG_DEDUP_MS = 30_000
 
     // conversationId → after-chat 回调动作
     private _pendingBroadcast: Map<string, PendingAfterChatAction> = new Map()
-    private _knownUserRooms: Set<string> = new Set()
+    // roomId → 待执行的 room 历史重置；重置移出 after-chat 关键路径，
+    // 由调度 tick 在会话空闲时异步执行，避免与聊天链抢 conversation 队列锁
+    private _pendingRoomResets: Map<number, PendingRoomReset> = new Map()
+    // conversationId → 调度器上次跳过/等待日志的原因与时间，用于按原因去重
+    private _lastTickLog: Map<string, { reason: string; time: number }> = new Map()
 
     private readonly MAX_MESSAGES = 100
     private readonly MAX_TIMESTAMPS = 200
+    private readonly MAX_ROOM_RESET_ATTEMPTS = 5
 
     constructor(ctx: Context, private _config: Config) {
         super(ctx, 'chatluna_proactive')
@@ -82,40 +106,28 @@ export class ProactiveChatService extends Service {
         this._stateFilePath = path.resolve(ctx.baseDir || process.cwd(), 'data', 'chatluna-proactive-trigger-state.json')
         this._imageCacheDir = path.resolve(ctx.baseDir || process.cwd(), 'data', 'chatluna-proactive-trigger', 'images')
 
-        ctx.on('chatluna/after-chat', async (conversationId, _sourceMessage, responseMessage) => {
+        ctx.on('chatluna/after-chat', async (conversationId, _sourceMessage, _responseMessage) => {
             const action = this._pendingBroadcast.get(conversationId)
             if (action) {
                 this._pendingBroadcast.delete(conversationId)
 
-                if (
-                    this._config.syncToAllRooms &&
-                    action.guildId &&
-                    action.participantUserIds?.length
-                ) {
-                    await this._syncToParticipantRooms(
-                        action.guildId,
-                        conversationId,
-                        responseMessage,
-                        action.participantUserIds
-                    )
-                }
-
                 if (action.resetRoomId != null) {
-                    try {
-                        const room = await resolveConversationRoom(this.ctx, action.resetRoomId)
-                        if (room) {
-                            await this._resetRoomHistory(room as ManagedRoom)
-                        }
-                    } catch (error) {
-                        this._logger.warn(`Failed to reset proactive room ${action.resetRoomId}: ${error}`)
-                    }
+                    // 只登记，不在这里同步 clearChatHistory：
+                    // 慢模型（如 dify workflow 单次 185s）持有 conversation 队列锁时，
+                    // 同步重置会等待 180s 超时；改由调度 tick 在会话空闲时异步执行
+                    this._pendingRoomResets.set(action.resetRoomId, {
+                        roomId: action.resetRoomId,
+                        ...(action.guildId ? { guildId: action.guildId } : {}),
+                        attempts: 0
+                    })
                 }
             }
 
             // 仅在主动触发的 after-chat 中清空消息历史
             // 用户直接触发 ChatLuna 时不清空，以便保底触发能收集到这些消息
             if (action?.isProactiveTrigger) {
-                const guildId = await this._resolveGuildIdByRoomConversationId(conversationId)
+                // guildId 由触发时直接携带，避免反查 chathub_room_group_member 时的多群歧义
+                const guildId = action.guildId ?? null
                 if (guildId) {
                     const pluginConversationId = `group:${guildId}`
                     if (this._chatMessages[pluginConversationId]?.length) {
@@ -160,6 +172,13 @@ export class ProactiveChatService extends Service {
             this._persistenceDisposable()
             this._persistenceDisposable = null
         }
+        this._pendingBroadcast.clear()
+        this._pendingRoomResets.clear()
+        this._sessions = {}
+        // 唤醒可能处于序列化间隔睡眠中的保存循环，并等待在途保存完成，
+        // 避免进程快速退出时最后的强制保存被睡眠吞掉
+        this._saveWakeUp?.()
+        if (this._saveInFlight) await this._saveInFlight
         await this._saveState(true)
         this._logInfo('ProactiveChatService 已停止')
     }
@@ -172,35 +191,38 @@ export class ProactiveChatService extends Service {
         const now = session.timestamp || Date.now()
 
         if (!profile) {
-            this._logMessageEvaluation(session, {
-                conversationId,
-                profileType: 'none',
-                cooldownRemainingMs: 0,
-                responseLocked: false,
-                activityEnabled: false,
-                activityScore: null,
-                activityThreshold: null,
-                messageCount: 0,
-                messageInterval: null,
-                activityTriggered: false,
-                idleEnabled: false,
-                idleMinutes: 0,
-                idleIntervalMinutes: null,
-                idleEligible: false,
-                guaranteedEnabled: false,
-                guaranteedMinutes: null,
-                guaranteedBaseType: 'none',
-                guaranteedBaseTime: 0,
-                guaranteedFirstEligibleMessageTime: 0,
-                guaranteedLastTriggerTime: 0,
-                guaranteedLastEligibleMessageTime: 0,
-                guaranteedElapsedSeconds: null,
-                guaranteedRemainingSeconds: null,
-                guaranteedHasEligibleMessage: false,
-                guaranteedEligible: false,
-                triggerReason: null,
-                finalDecision: 'no-profile'
-            })
+            // verboseLog 关闭时跳过构造判断日志 payload，避免对无关会话的每条消息产生分配开销
+            if (this._config.verboseLog) {
+                this._logMessageEvaluation(session, {
+                    conversationId,
+                    profileType: 'none',
+                    cooldownRemainingMs: 0,
+                    responseLocked: false,
+                    activityEnabled: false,
+                    activityScore: null,
+                    activityThreshold: null,
+                    messageCount: 0,
+                    messageInterval: null,
+                    activityTriggered: false,
+                    idleEnabled: false,
+                    idleMinutes: 0,
+                    idleIntervalMinutes: null,
+                    idleEligible: false,
+                    guaranteedEnabled: false,
+                    guaranteedMinutes: null,
+                    guaranteedBaseType: 'none',
+                    guaranteedBaseTime: 0,
+                    guaranteedFirstEligibleMessageTime: 0,
+                    guaranteedLastTriggerTime: 0,
+                    guaranteedLastEligibleMessageTime: 0,
+                    guaranteedElapsedSeconds: null,
+                    guaranteedRemainingSeconds: null,
+                    guaranteedHasEligibleMessage: false,
+                    guaranteedEligible: false,
+                    triggerReason: null,
+                    finalDecision: 'no-profile'
+                })
+            }
             this._debug(`[handleMessage] session not applicable: uid=${session.uid} guildId=${session.guildId} isDirect=${session.isDirect}`)
             await next(); return
         }
@@ -299,41 +321,44 @@ export class ProactiveChatService extends Service {
             guaranteedHasEligibleMessage &&
             guaranteedRemainingSeconds === 0
 
-        this._logMessageEvaluation(session, {
-            conversationId,
-            profileType: this._getProfileType(session, profile),
-            cooldownRemainingMs,
-            responseLocked: state.responseLocked,
-            activityEnabled,
-            activityScore: activityEnabled ? state.lastActivityScore : null,
-            activityThreshold: activityEnabled ? state.currentThreshold : null,
-            messageCount: state.messageCount,
-            messageInterval,
-            activityTriggered: triggerReason?.type === 'activity',
-            idleEnabled,
-            idleMinutes,
-            idleIntervalMinutes,
-            idleEligible,
-            guaranteedEnabled,
-            guaranteedMinutes,
-            guaranteedBaseType,
-            guaranteedBaseTime,
-            guaranteedFirstEligibleMessageTime: state.firstProactiveEligibleMessageTime ?? 0,
-            guaranteedLastTriggerTime: lastProactive,
-            guaranteedLastEligibleMessageTime: state.lastProactiveEligibleMessageTime ?? 0,
-            guaranteedElapsedSeconds,
-            guaranteedRemainingSeconds,
-            guaranteedHasEligibleMessage,
-            guaranteedEligible,
-            triggerReason: triggerReason?.reason ?? null,
-            finalDecision: triggerReason
-                ? `${triggerReason.type}-trigger`
-                : cooldownRemainingMs > 0
-                    ? 'cooldown'
-                    : state.responseLocked
-                        ? 'response-locked'
-                        : 'skip'
-        })
+        // verboseLog 关闭时跳过构造判断日志 payload，避免活跃群每条消息的分配开销
+        if (this._config.verboseLog) {
+            this._logMessageEvaluation(session, {
+                conversationId,
+                profileType: this._getProfileType(session, profile),
+                cooldownRemainingMs,
+                responseLocked: state.responseLocked,
+                activityEnabled,
+                activityScore: activityEnabled ? state.lastActivityScore : null,
+                activityThreshold: activityEnabled ? state.currentThreshold : null,
+                messageCount: state.messageCount,
+                messageInterval,
+                activityTriggered: triggerReason?.type === 'activity',
+                idleEnabled,
+                idleMinutes,
+                idleIntervalMinutes,
+                idleEligible,
+                guaranteedEnabled,
+                guaranteedMinutes,
+                guaranteedBaseType,
+                guaranteedBaseTime,
+                guaranteedFirstEligibleMessageTime: state.firstProactiveEligibleMessageTime ?? 0,
+                guaranteedLastTriggerTime: lastProactive,
+                guaranteedLastEligibleMessageTime: state.lastProactiveEligibleMessageTime ?? 0,
+                guaranteedElapsedSeconds,
+                guaranteedRemainingSeconds,
+                guaranteedHasEligibleMessage,
+                guaranteedEligible,
+                triggerReason: triggerReason?.reason ?? null,
+                finalDecision: triggerReason
+                    ? `${triggerReason.type}-trigger`
+                    : cooldownRemainingMs > 0
+                        ? 'cooldown'
+                        : state.responseLocked
+                            ? 'response-locked'
+                            : 'skip'
+            })
+        }
 
         if (triggerReason) {
             await this._triggerResponse(session, triggerReason, profile)
@@ -343,8 +368,64 @@ export class ProactiveChatService extends Service {
         await next()
     }
 
+    /**
+     * 调度器每秒 tick，跳过/等待分支的日志按"原因变化或 30 秒"去重，
+     * 避免 verboseLog 开启时空闲会话产生 1 条/秒的日志刷屏
+     */
+    private _tickLog(conversationId: string, reason: string, message: string): void {
+        const last = this._lastTickLog.get(conversationId)
+        const now = Date.now()
+        if (last && last.reason === reason && now - last.time < this.TICK_LOG_DEDUP_MS) return
+        this._lastTickLog.set(conversationId, { reason, time: now })
+        this._debug(message)
+    }
+
+    /**
+     * 异步执行 after-chat 登记的 room 历史重置。
+     * 在对应会话空闲（无触发执行中）时才执行，避免与聊天链竞争 conversation 队列锁；
+     * 失败自动重试，达到上限后告警放弃。
+     */
+    private async _processPendingRoomResets(): Promise<void> {
+        for (const [roomId, pending] of this._pendingRoomResets) {
+            if (pending.guildId) {
+                const state = this._conversationStates[`group:${pending.guildId}`]
+                if (state?.responseLocked) continue
+            }
+
+            try {
+                const room = await resolveConversationRoom(this.ctx, roomId)
+                if (room) {
+                    await this._resetRoomHistory(room as ManagedRoom)
+                }
+                this._pendingRoomResets.delete(roomId)
+            } catch (error) {
+                pending.attempts++
+                if (pending.attempts >= this.MAX_ROOM_RESET_ATTEMPTS) {
+                    this._logger.warn(
+                        `Failed to reset proactive room ${roomId} after ${pending.attempts} attempts: ${error}`
+                    )
+                    this._pendingRoomResets.delete(roomId)
+                }
+            }
+        }
+    }
+
     private async _processSchedulerTick(): Promise<void> {
         const now = Date.now()
+
+        // 清理超时未消费的 after-chat pending 动作：
+        // receiveCommand 正常返回但 after-chat 未触发（或事件 conversationId 与预注册不一致）时条目会永久残留
+        for (const [key, action] of this._pendingBroadcast) {
+            if (now - action.createdAt > this.PENDING_ACTION_TTL_MS) {
+                this._debug(
+                    `[schedulerTick] evict stale pending action, conversationId=${key}, age=${Math.floor((now - action.createdAt) / 1000)}s`
+                )
+                this._pendingBroadcast.delete(key)
+            }
+        }
+
+        this._pruneStaleConversations()
+        this._processPendingRoomResets()
 
         for (const [conversationId, state] of Object.entries(this._conversationStates)) {
             const session = this._sessions[conversationId]
@@ -358,15 +439,15 @@ export class ProactiveChatService extends Service {
                 : 0
 
             if (cooldownRemaining > 0) {
-                this._debug(`[schedulerTick] ${conversationId}: in cooldown, ${Math.ceil(cooldownRemaining / 1000)}s remaining`)
+                this._tickLog(conversationId, 'cooldown', `[schedulerTick] ${conversationId}: in cooldown, ${Math.ceil(cooldownRemaining / 1000)}s remaining`)
                 continue
             }
             if (state.responseLocked) {
-                this._debug(`[schedulerTick] ${conversationId}: responseLocked, skipping`)
+                this._tickLog(conversationId, 'response-locked', `[schedulerTick] ${conversationId}: responseLocked, skipping`)
                 continue
             }
             if (state.retryDisabled) {
-                this._debug(`[schedulerTick] ${conversationId}: retry disabled after ${state.failureCount} consecutive failures`)
+                this._tickLog(conversationId, 'retry-disabled', `[schedulerTick] ${conversationId}: retry disabled after ${state.failureCount} consecutive failures`)
                 continue
             }
 
@@ -375,7 +456,9 @@ export class ProactiveChatService extends Service {
                 : 0
 
             if (failureCooldownRemaining > 0) {
-                this._debug(
+                this._tickLog(
+                    conversationId,
+                    'failure-cooldown',
                     `[schedulerTick] ${conversationId}: in failure cooldown, ${Math.ceil(failureCooldownRemaining / 1000)}s remaining`
                 )
                 continue
@@ -394,7 +477,7 @@ export class ProactiveChatService extends Service {
             } else if (state.lastMessageTime && profile.enableIdleTrigger) {
                 const idleMs = now - state.lastMessageTime
                 const waitMs = (profile.idleIntervalMinutes ?? 180) * 60 * 1000
-                this._debug(`[schedulerTick] ${conversationId}: idle=${Math.floor(idleMs / 1000)}s, need=${Math.floor(waitMs / 1000)}s`)
+                this._tickLog(conversationId, 'idle-waiting', `[schedulerTick] ${conversationId}: idle=${Math.floor(idleMs / 1000)}s, need=${Math.floor(waitMs / 1000)}s`)
             }
 
             // 保底触发检查：
@@ -415,7 +498,9 @@ export class ProactiveChatService extends Service {
                         : 0
 
                 if (guaranteedBaseTime <= 0) {
-                    this._debug(
+                    this._tickLog(
+                        conversationId,
+                        'guaranteed-no-base',
                         `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no base time, guaranteedMinutes=${profile.guaranteedTriggerMinutes}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastProactiveTriggerTime=${lastProactive}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
                     )
                     continue
@@ -427,7 +512,9 @@ export class ProactiveChatService extends Service {
                         : (state.firstProactiveEligibleMessageTime ?? 0) > 0 && (state.messageCount ?? 0) > 0
 
                 if (!hasEligibleMessageForGuaranteed) {
-                    this._debug(
+                    this._tickLog(
+                        conversationId,
+                        'guaranteed-no-eligible',
                         `[schedulerTick] ${conversationId}: guaranteed trigger skipped, no proactive-eligible message for current guaranteed cycle, baseType=${guaranteedBaseType}, baseTime=${guaranteedBaseTime}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastProactiveTriggerTime=${lastProactive}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
                     )
                     continue
@@ -437,7 +524,9 @@ export class ProactiveChatService extends Service {
                 const elapsedSinceGuaranteedBase = now - guaranteedBaseTime
                 const guaranteedRemainingMs = guaranteedMs - elapsedSinceGuaranteedBase
                 if (elapsedSinceGuaranteedBase < guaranteedMs) {
-                    this._debug(
+                    this._tickLog(
+                        conversationId,
+                        'guaranteed-waiting',
                         `[schedulerTick] ${conversationId}: guaranteed trigger waiting, baseType=${guaranteedBaseType}, elapsed=${Math.floor(elapsedSinceGuaranteedBase / 1000)}s, remaining=${Math.ceil(guaranteedRemainingMs / 1000)}s, threshold=${profile.guaranteedTriggerMinutes}min, baseTime=${guaranteedBaseTime}, firstEligibleMessageTime=${state.firstProactiveEligibleMessageTime ?? 0}, lastProactiveTriggerTime=${lastProactive}, lastEligibleMessageTime=${state.lastProactiveEligibleMessageTime ?? 0}, messageCount=${state.messageCount ?? 0}`
                     )
                     continue
@@ -552,11 +641,11 @@ export class ProactiveChatService extends Service {
                 const pendingAction: PendingAfterChatAction = {
                     // 标记为主动触发，after-chat 仅在此情况下清空消息缓存
                     // 用户直接触发 ChatLuna 时不会写入此标记，从而保留消息供保底触发使用
-                    isProactiveTrigger: true
-                }
-                if (!session.isDirect && trigger.type === 'activity') {
-                    pendingAction.guildId = session.guildId
-                    pendingAction.participantUserIds = this._collectParticipantUserIds(msgs)
+                    isProactiveTrigger: true,
+                    createdAt: Date.now(),
+                    // 群聊触发直接携带 guildId，供 after-chat 清理群历史与图片缓存。
+                    // 必须排除 isDirect：部分平台的私聊会话也带 guildId，误带会导致私聊触发清空该群的历史池
+                    ...( !session.isDirect && session.guildId ? { guildId: session.guildId } : {})
                 }
                 if (resetAfterChat) {
                     pendingAction.resetRoomId = room.roomId
@@ -606,11 +695,19 @@ export class ProactiveChatService extends Service {
                 )
             }
 
-            await this.ctx.chatluna.chatChain.receiveCommand(
+            const ok = await this.ctx.chatluna.chatChain.receiveCommand(
                 requestSession,
                 '',
                 commandOptions
             )
+            if (ok === false) {
+                // chatluna 聊天链的软失败（模型不可用/平台未加载/链中止）以 resolve false 表达而非 reject，
+                // 且此时已向会话发送错误提示；必须按失败记账，否则会误清消息池、重置保底/冷却基准，
+                // 且 failureCooldown/maxRetryAttempts 退避保护永远不会介入
+                throw new Error(
+                    `[triggerResponse] chatluna 聊天链未正常完成（模型/平台/room 解析失败或链中止），conversationId=${conversationId}, triggerType=${trigger.type}, reason=${trigger.reason}`
+                )
+            }
 
             if (this._config.debugLog || this._config.verboseLog) {
                 this._logger.info(
@@ -649,57 +746,30 @@ export class ProactiveChatService extends Service {
         }
     }
 
-    private async _syncToParticipantRooms(
-        guildId: string,
-        excludeConversationId: string,
-        aiMessage: any,
-        participantUserIds: string[]
-    ): Promise<void> {
-        if (participantUserIds.length === 0) return
-
-        const uniqueParticipantIds = [...new Set(participantUserIds)]
-        const rooms: ManagedRoom[] = []
-
-        for (const userId of uniqueParticipantIds) {
-            try {
-                const room = await this._ensureUserRoomForGroup(userId, guildId)
-                if (room && room.conversationId && room.conversationId !== excludeConversationId) {
-                    rooms.push(room)
-                }
-            } catch (e) {
-                this._logInfo(`Failed to ensure participant room for user ${userId} in guild ${guildId}: ${e}`)
-            }
-        }
-
-        const uniqueRooms = rooms.filter((room, index, arr) =>
-            arr.findIndex(item => item.roomId === room.roomId) === index
-        )
-
-        if (uniqueRooms.length === 0) return
-
-        this._debug(`Syncing proactive message to ${uniqueRooms.length} participant rooms in guild ${guildId}`)
-
-        for (const room of uniqueRooms) {
-            try {
-                const history = new KoishiChatMessageHistory(this.ctx, room.conversationId, 10000)
-                await history.loadConversation()
-                await history.addMessage(aiMessage as any)
-            } catch (e) {
-                this._logInfo(`Failed to sync to participant room ${room.roomId} (${room.conversationId}): ${e}`)
-            }
-        }
-    }
-
     private async _resolveExecutionContext(
         session: Session,
         trigger: TriggerReason,
         messages: ChatMessage[] = []
     ): Promise<{ room: ManagedRoom | null; requestSession: Session; resetAfterChat: boolean }> {
-        if (trigger.type === 'idle' && !session.isDirect) {
+        // 群聊触发（活跃度/保底/空闲）统一锚定到每群一个 proactive room。
+        // 不随最后发言者轮转 room：chatluna 会为每个新 conversationId 创建 ChatInterface，
+        // 且其构造器在 root 上下文注册的 dispose 监听永不注销，轮转会让泄漏实例数达到 O(用户数)。
+        if (!session.isDirect) {
+            if (!session.guildId) {
+                this._logger.warn(
+                    `[resolveExecutionContext] 群聊触发缺少 guildId，userId=${session.userId}`
+                )
+                return {
+                    room: null,
+                    requestSession: session,
+                    resetAfterChat: false
+                }
+            }
+
             const room = await this._ensureProactiveRoomForGuild(session)
             if (room) {
                 this._logInfo(
-                    `[resolveExecutionContext] idle resolved proactive room, guildId=${session.guildId}, roomId=${room.roomId}, conversationId=${room.conversationId}`
+                    `[resolveExecutionContext] ${trigger.type} resolved proactive room, guildId=${session.guildId}, roomId=${room.roomId}, conversationId=${room.conversationId}`
                 )
                 return {
                     room,
@@ -709,43 +779,14 @@ export class ProactiveChatService extends Service {
             }
 
             this._logger.warn(
-                `[resolveExecutionContext] 空闲触发未能解析 proactive room，guildId=${session.guildId}, userId=${session.userId}`
-            )
-        }
-
-        if (trigger.type === 'activity' && !session.isDirect) {
-            if (!session.userId || !session.guildId) {
-                this._logger.warn(
-                    `[resolveExecutionContext] 活跃度触发缺少必要会话标识，guildId=${session.guildId}, userId=${session.userId}`
-                )
-                return {
-                    room: null,
-                    requestSession: session,
-                    resetAfterChat: false
-                }
-            }
-
-            const room = await this._ensureUserRoomForGroup(session.userId, session.guildId)
-            if (room) {
-                this._logInfo(
-                    `[resolveExecutionContext] 活跃度触发已解析用户 room，guildId=${session.guildId}, userId=${session.userId}, roomId=${room.roomId}, conversationId=${room.conversationId}`
-                )
-                return {
-                    room,
-                    requestSession: session,
-                    resetAfterChat: false
-                }
-            }
-
-            this._logger.warn(
-                `[resolveExecutionContext] 活跃度触发未能解析或补建用户 room，guildId=${session.guildId}, userId=${session.userId}`
+                `[resolveExecutionContext] 触发未能解析 proactive room，guildId=${session.guildId}, userId=${session.userId}`
             )
         }
 
         const room = await queryJoinedConversationRoom(this.ctx, session)
         if (room) {
-            this._logInfo(
-                `[resolveExecutionContext] 已命中 joined room 回退路径，guildId=${session.guildId}, userId=${session.userId}, roomId=${room.roomId}, conversationId=${room.conversationId}`
+            this._logger.warn(
+                `[resolveExecutionContext] guild room 供给失败，回退到用户 joined room 执行（该路径不重置历史，存在内存放大风险），guildId=${session.guildId}, userId=${session.userId}, roomId=${room.roomId}, conversationId=${room.conversationId}`
             )
         } else {
             this._logInfo(
@@ -768,125 +809,75 @@ export class ProactiveChatService extends Service {
             return null
         }
 
+        try {
+            const existingRoom = await this._resolveProactiveRoomForGuild(guildId)
+            if (existingRoom) return existingRoom
+
+            const templateRoom = await this._findAnyUsableRoomInGuild(guildId)
+                ?? this._buildLocalTemplateRoom()
+
+            if (!templateRoom) {
+                this._logger.warn(`Cannot provision proactive room for guild ${guildId}: no template room available`)
+                return null
+            }
+
+            // 创建段经 _roomCreateQueue 串行化：roomId 按 max(roomId)+1 分配，
+            // 调度器 tick 重入可让不同群的触发并发执行，无互斥时会撞主键
+            const createTask = this._roomCreateQueue.then(async () => {
+                const room: ManagedRoom = {
+                    conversationId: randomUUID(),
+                    model: templateRoom.model,
+                    preset: templateRoom.preset,
+                    roomName: `Proactive Trigger Room ${guildId}`,
+                    roomMasterId: proactiveUserId,
+                    roomId: (await getConversationRoomCount(this.ctx)) + 1,
+                    visibility: 'private',
+                    chatMode: templateRoom.chatMode,
+                    password: null,
+                    updatedTime: new Date()
+                }
+                await createConversationRoom(this.ctx, this._createProactiveSession(session), room as any)
+                return room
+            })
+            this._roomCreateQueue = createTask.catch(() => {})
+            const room = await createTask
+            this._logInfo(`Provisioned proactive room ${room.roomId} for guild ${guildId}`)
+            return room
+        } catch (error) {
+            // 创建失败（如多实例共享 DB 时的主键冲突）：重查一次，可能已被其他调用方建好
+            this._logger.warn(
+                `[ensureProactiveRoomForGuild] 创建 proactive room 失败，guildId=${guildId}, error=${error}`
+            )
+            try {
+                const room = await this._resolveProactiveRoomForGuild(guildId)
+                if (room) return room
+            } catch (recheckError) {
+                this._logger.warn(
+                    `[ensureProactiveRoomForGuild] 重查 proactive room 失败，guildId=${guildId}, error=${recheckError}`
+                )
+            }
+            return null
+        }
+    }
+
+    private async _resolveProactiveRoomForGuild(guildId: string): Promise<ManagedRoom | null> {
         const userRecords = await this.ctx.database.get('chathub_user', {
-            userId: proactiveUserId,
+            userId: '__proactive_trigger__',
             groupId: guildId
         })
 
-        if (userRecords.length > 0) {
-            const room = await resolveConversationRoom(this.ctx, userRecords[0].defaultRoomId)
-            if (room) return room as ManagedRoom
-        }
+        if (userRecords.length === 0) return null
 
-        const templateRoom = await this._findAnyUsableRoomInGuild(guildId)
-            ?? await getTemplateConversationRoom(this.ctx, this.ctx.scope.parent.config)
-
-        if (!templateRoom) {
-            this._logger.warn(`Cannot provision proactive room for guild ${guildId}: no template room available`)
-            return null
-        }
-
-        const room: ManagedRoom = {
-            conversationId: randomUUID(),
-            model: templateRoom.model,
-            preset: templateRoom.preset,
-            roomName: `Proactive Trigger Room ${session.guildId}`,
-            roomMasterId: proactiveUserId,
-            roomId: (await getConversationRoomCount(this.ctx)) + 1,
-            visibility: 'private',
-            chatMode: templateRoom.chatMode,
-            password: null,
-            updatedTime: new Date()
-        }
-
-        await createConversationRoom(this.ctx, this._createProactiveSession(session), room as any)
-        this._logInfo(`Provisioned proactive room ${room.roomId} for guild ${guildId}`)
-        return room
-    }
-
-    private async _findAnyUsableRoomInGuild(guildId: string): Promise<ManagedRoom | null> {
-        const groupMembers = await this.ctx.database.get('chathub_room_group_member', { groupId: guildId })
-        if (groupMembers.length === 0) return null
-
-        const roomIds = [...new Set(groupMembers.map(item => item.roomId))]
-        const rooms = await this.ctx.database.get('chathub_room', { roomId: { $in: roomIds } as any })
-        const room = rooms.find(item => item.conversationId && item.model && item.preset && item.chatMode)
+        const room = await resolveConversationRoom(this.ctx, userRecords[0].defaultRoomId)
         return (room as ManagedRoom) ?? null
     }
 
-    private async _ensureUserRoomForGroup(userId: string, guildId: string): Promise<ManagedRoom | null> {
-        const existingUserRecords = await this.ctx.database.get('chathub_user', {
-            userId,
-            groupId: guildId
-        })
-
-        if (existingUserRecords.length > 0) {
-            this._logInfo(
-                `[ensureUserRoomForGroup] found chathub_user record, guildId=${guildId}, userId=${userId}, defaultRoomId=${existingUserRecords[0].defaultRoomId}`
-            )
-            const existingRoom = await resolveConversationRoom(this.ctx, existingUserRecords[0].defaultRoomId)
-            if (existingRoom) {
-                this._logInfo(
-                    `[ensureUserRoomForGroup] 已解析现有 room，guildId=${guildId}, userId=${userId}, roomId=${existingRoom.roomId}, conversationId=${existingRoom.conversationId}`
-                )
-                this._knownUserRooms.add(`${guildId}:${userId}`)
-                return existingRoom as ManagedRoom
-            }
-
-            this._logInfo(
-                `[ensureUserRoomForGroup] defaultRoomId exists but room missing, guildId=${guildId}, userId=${userId}, defaultRoomId=${existingUserRecords[0].defaultRoomId}`
-            )
-        } else {
-            this._logInfo(
-                `[ensureUserRoomForGroup] no chathub_user record, guildId=${guildId}, userId=${userId}, provisioning required`
-            )
-        }
-
-        const guildTemplateRoom = await this._findAnyUsableRoomInGuild(guildId)
-        const localTemplateRoom = guildTemplateRoom ?? this._buildLocalTemplateRoom()
-        const templateRoom = localTemplateRoom
-
-        if (!templateRoom) {
-            this._logger.warn(`Cannot provision user room for user ${userId} in guild ${guildId}: no template room available`)
-            return null
-        }
-
-        this._logInfo(
-            `[ensureUserRoomForGroup] 使用模板 room 进行补建，guildId=${guildId}, userId=${userId}, source=${guildTemplateRoom ? 'guild-room' : 'local-template'}, model=${templateRoom.model}, preset=${templateRoom.preset}, chatMode=${templateRoom.chatMode}`
-        )
-
-        const room: ManagedRoom = {
-            conversationId: randomUUID(),
-            model: templateRoom.model,
-            preset: templateRoom.preset,
-            roomName: `Proactive User Room ${guildId}:${userId}`,
-            roomMasterId: userId,
-            roomId: (await getConversationRoomCount(this.ctx)) + 1,
-            visibility: 'private',
-            chatMode: templateRoom.chatMode,
-            password: null,
-            updatedTime: new Date()
-        }
-
-        try {
-            await createConversationRoom(this.ctx, this._createUserRoomSession(guildId, userId), room as any)
-            this._knownUserRooms.add(`${guildId}:${userId}`)
-            this._logInfo(`已为用户补建 room，guildId=${guildId}, userId=${userId}, roomId=${room.roomId}`)
-            return room
-        } catch (error) {
-            this._logger.error(
-                `[ensureUserRoomForGroup] 补建 room 失败，guildId=${guildId}, userId=${userId}, roomId=${room.roomId}, conversationId=${room.conversationId}, error=${error}`
-            )
-            return null
-        }
-    }
-
-    private async _resetRoomHistory(room: ManagedRoom): Promise<void> {
-        const chatInterface = this.ctx.chatluna.queryInterfaceWrapper(room as any, false)
-        await chatInterface?.clearChatHistory(room as any)
-        this._debug(`Reset proactive room history for roomId=${room.roomId}, conversationId=${room.conversationId}`)
-    }
-
+    /**
+     * 使用 chatluna 主插件配置构建本地模板 room。
+     * 不使用 chatluna 的 getTemplateConversationRoom：其内部读取 ctx.scope.parent.config
+     * （即调用方父作用域的配置），从本插件调用会读到本插件配置，并在 defaultChatMode 缺失时
+     * 直接抛出 ROOM_TEMPLATE_INVALID，导致无 room 群的首次触发持续失败。
+     */
     private _buildLocalTemplateRoom(): ManagedRoom | null {
         const config = this.ctx.chatluna?.currentConfig
 
@@ -911,20 +902,43 @@ export class ProactiveChatService extends Service {
         }
     }
 
-    private _createProactiveSession(session: Session): Session {
-        const proactiveUserId = '__proactive_trigger__'
-        const baseSession = session as any
-        const cloned = Object.create(Object.getPrototypeOf(baseSession))
-        const descriptors = Object.getOwnPropertyDescriptors(baseSession)
+    private async _findAnyUsableRoomInGuild(guildId: string): Promise<ManagedRoom | null> {
+        const groupMembers = await this.ctx.database.get('chathub_room_group_member', { groupId: guildId })
+        if (groupMembers.length === 0) return null
 
+        const roomIds = [...new Set(groupMembers.map(item => item.roomId))]
+        const rooms = await this.ctx.database.get('chathub_room', { roomId: { $in: roomIds } as any })
+        const room = rooms.find(item => item.conversationId && item.model && item.preset && item.chatMode)
+        return (room as ManagedRoom) ?? null
+    }
+
+    private async _resetRoomHistory(room: ManagedRoom): Promise<void> {
+        const chatInterface = this.ctx.chatluna.queryInterfaceWrapper(room as any, false)
+        await chatInterface?.clearChatHistory(room as any)
+        this._debug(`Reset proactive room history for roomId=${room.roomId}, conversationId=${room.conversationId}`)
+    }
+
+    private _createProactiveSession(session: Session): Session {
+        const baseSession = session as any
+        // 以原 session 为原型派生，而非描述符克隆：koishi 4.18 的 session 实例方法
+        // （stripped/text/send 等）经 cordis mixin 的 internal accessor 按接收者分发，
+        // 描述符克隆会丢失该分发路径（生产实证：session.stripped 为 undefined、
+        // session.text 非函数）。原型链直通原对象可完整保留解析路径。
+        const cloned = Object.create(baseSession) as any
+
+        // 复制自身数据字段，保持 spread/枚举兼容（原克隆语义不变的部分）
+        const descriptors = Object.getOwnPropertyDescriptors(baseSession)
         delete descriptors.author
         delete descriptors.userId
         delete descriptors.username
-
         Object.defineProperties(cloned, descriptors)
 
+        // 影子属性覆盖合成身份，原 session 对象保持不变。
+        // author 必须是对象而非 undefined：koishi 的 session.username getter 会读
+        // this.author.nick，OneBot 等编码器发送时依赖它——置 undefined 会让每条
+        // 主动回复在发送阶段崩溃（TypeError: reading 'nick'）
         Object.defineProperty(cloned, 'userId', {
-            value: proactiveUserId,
+            value: '__proactive_trigger__',
             writable: true,
             configurable: true,
             enumerable: true
@@ -935,53 +949,26 @@ export class ProactiveChatService extends Service {
             configurable: true,
             enumerable: true
         })
+        Object.defineProperty(cloned, 'author', {
+            value: {
+                id: '__proactive_trigger__',
+                userId: '__proactive_trigger__',
+                name: 'proactive-trigger',
+                nick: 'proactive-trigger'
+            },
+            writable: true,
+            configurable: true,
+            enumerable: true
+        })
 
-        return cloned as Session
-    }
-
-    private _createUserRoomSession(guildId: string, userId: string): Session {
-        const baseSession = this._sessions[`group:${guildId}`] as any
-        if (!baseSession) {
-            this._logger.error(
-                `[createUserRoomSession] missing cached base session, guildId=${guildId}, userId=${userId}`
+        // 早期哨兵：若未来 koishi/chatluna 再次改变 session 形状，第一时间在日志暴露
+        if (typeof cloned.text !== 'function') {
+            this._logger.warn(
+                '[createProactiveSession] 克隆会话缺少 text 方法，当前 koishi/chatluna 组合可能不兼容，请反馈'
             )
-            throw new Error(`Cannot provision user room for guild ${guildId}: no cached session available`)
         }
 
-        const cloned = Object.create(Object.getPrototypeOf(baseSession))
-        const descriptors = Object.getOwnPropertyDescriptors(baseSession)
-
-        delete descriptors.author
-        delete descriptors.userId
-        delete descriptors.username
-        delete descriptors.guildId
-
-        Object.defineProperties(cloned, descriptors)
-
-        Object.defineProperty(cloned, 'guildId', {
-            value: guildId,
-            writable: true,
-            configurable: true,
-            enumerable: true
-        })
-        Object.defineProperty(cloned, 'userId', {
-            value: userId,
-            writable: true,
-            configurable: true,
-            enumerable: true
-        })
-        Object.defineProperty(cloned, 'username', {
-            value: userId,
-            writable: true,
-            configurable: true,
-            enumerable: true
-        })
-
         return cloned as Session
-    }
-
-    private _collectParticipantUserIds(messages: ChatMessage[]): string[] {
-        return [...new Set(messages.map((message) => message.id).filter(Boolean))]
     }
 
     private _getProfileType(
@@ -1361,7 +1348,7 @@ export class ProactiveChatService extends Service {
             return false
         }
 
-        const images = await this._cacheImages(conversationId, imageUrls)
+        const images = this._cacheImages(conversationId, imageUrls)
 
         const msg: ChatMessage = {
             id: session.author?.id ?? session.userId ?? 'unknown',
@@ -1378,7 +1365,6 @@ export class ProactiveChatService extends Service {
 
         const cap = Math.max(1, profile?.historyMessageLimit || this.MAX_MESSAGES)
         this._appendChatMessage(conversationId, msg, cap)
-        this._prewarmUserRoomIfNeeded(conversationId, session, profile ?? null)
         return true
     }
 
@@ -1394,26 +1380,6 @@ export class ProactiveChatService extends Service {
             this._chatMessages[conversationId] = this._chatMessages[conversationId].slice(-limit)
         }
         this._markDirty()
-    }
-
-    private _prewarmUserRoomIfNeeded(
-        conversationId: string,
-        session: Session,
-        profile: TriggerProfileConfig | null
-    ): void {
-        if (session.isDirect || !profile || !this._isGroupProfile(profile)) return
-        if (!session.guildId || !session.userId) return
-
-        const cacheKey = `${session.guildId}:${session.userId}`
-        if (this._knownUserRooms.has(cacheKey)) return
-
-        this._knownUserRooms.add(cacheKey)
-        void this._ensureUserRoomForGroup(session.userId, session.guildId).catch((error) => {
-            this._knownUserRooms.delete(cacheKey)
-            this._logger.warn(
-                `[ensureUserRoomPrewarm] conversationId=${conversationId} guildId=${session.guildId} userId=${session.userId} error=${error}`
-            )
-        })
     }
 
     private _pickImageUrls(session: Session): string[] {
@@ -1445,12 +1411,21 @@ export class ProactiveChatService extends Service {
         return path.join(this._getConversationImageDir(conversationId), `${imageKey}${ext}`)
     }
 
-    private async _cacheImages(conversationId: string, urls: string[]): Promise<CachedImageRef[]> {
-        const tasks = urls.map((url) => this._cacheImage(conversationId, url))
-        return Promise.all(tasks)
+    private _cacheImages(conversationId: string, urls: string[]): CachedImageRef[] {
+        // 同步登记引用（暂无 localPath，触发时若文件尚未就绪会回退原始 URL），
+        // 下载异步完成后补写 localPath——避免慢图把中间件链（含 chatluna 对该消息的常规处理）拖住数分钟
+        return urls.map((url) => {
+            const ref: CachedImageRef = { key: this._getImageKey(url), originalUrl: url }
+            void this._cacheImage(conversationId, url)
+                .then((localPath) => {
+                    if (localPath) ref.localPath = localPath
+                })
+                .catch(() => {})
+            return ref
+        })
     }
 
-    private async _cacheImage(conversationId: string, url: string): Promise<CachedImageRef> {
+    private async _cacheImage(conversationId: string, url: string): Promise<string | undefined> {
         const key = this._getImageKey(url)
         const ext = this._getImageExtension(url)
         const localPath = this._getImageFilePath(conversationId, key, ext)
@@ -1458,23 +1433,27 @@ export class ProactiveChatService extends Service {
         try {
             await fs.mkdir(this._getConversationImageDir(conversationId), { recursive: true })
             await fs.access(localPath)
-            return { key, originalUrl: url, localPath }
+            return localPath
         } catch {}
 
         try {
-            const response = await fetch(url)
+            // 老版本 Node（<17.3）无 AbortSignal.timeout，退化为无超时
+            const timeoutSignal = typeof AbortSignal.timeout === 'function'
+                ? AbortSignal.timeout(15_000)
+                : undefined
+            const response = await fetch(url, timeoutSignal ? { signal: timeoutSignal } : {})
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status}`)
             }
 
             const buffer = Buffer.from(await response.arrayBuffer())
             await fs.writeFile(localPath, buffer)
-            return { key, originalUrl: url, localPath }
+            return localPath
         } catch (error) {
             this._logger.warn(
                 `[cacheImage] 图片缓存失败，conversationId=${conversationId}, key=${key}, url=${url}, error=${error}`
             )
-            return { key, originalUrl: url }
+            return undefined
         }
     }
 
@@ -1674,6 +1653,29 @@ export class ProactiveChatService extends Service {
         }
     }
 
+    /**
+     * 淘汰已不在配置范围内的会话键（群/私聊被移除或不再应用默认模板），
+     * 避免 _conversationStates/_chatMessages/_messageTimestamps/_sessions 与状态文件只增不减。
+     */
+    private _pruneStaleConversations(): void {
+        const conversationIds = new Set([
+            ...Object.keys(this._conversationStates),
+            ...Object.keys(this._chatMessages),
+            ...Object.keys(this._messageTimestamps),
+            ...Object.keys(this._sessions)
+        ])
+
+        for (const conversationId of conversationIds) {
+            if (this._getProfileByConversationId(conversationId)) continue
+            delete this._conversationStates[conversationId]
+            delete this._chatMessages[conversationId]
+            delete this._messageTimestamps[conversationId]
+            delete this._sessions[conversationId]
+            this._lastTickLog.delete(conversationId)
+            this._dirty = true
+        }
+    }
+
     private async _loadState(): Promise<void> {
         try {
             const raw = await fs.readFile(this._stateFilePath, 'utf8')
@@ -1694,9 +1696,22 @@ export class ProactiveChatService extends Service {
             return
         }
 
+        const task = this._runSaveLoop()
+        this._saveInFlight = task
+        try {
+            await task
+        } finally {
+            this._saveInFlight = null
+        }
+    }
+
+    private async _runSaveLoop(): Promise<void> {
         this._isSaving = true
         try {
             do {
+                // prune 放在标志复位之前：删除结果直接体现在本轮序列化对象里，
+                // 避免复位后再置脏导致配置变更后多跑一轮"全量序列化 + 30s 等待"
+                this._pruneStaleConversations()
                 this._pendingSave = false
                 this._dirty = false
                 const payload: PersistedState = {
@@ -1707,12 +1722,28 @@ export class ProactiveChatService extends Service {
                 }
                 await fs.mkdir(path.dirname(this._stateFilePath), { recursive: true })
                 await fs.writeFile(this._stateFilePath, JSON.stringify(payload), 'utf8')
+                this._lastSaveTime = Date.now()
+                // 序列化期间有新变更时，与上次全量序列化至少间隔 MIN_SAVE_INTERVAL_MS，
+                // 避免活跃群把 do-while 变成无间歇的 stringify 热循环（大字符串churn导致 RSS 攀升）
+                if (this._pendingSave || this._dirty) {
+                    const waitMs = this.MIN_SAVE_INTERVAL_MS - (Date.now() - this._lastSaveTime)
+                    if (waitMs > 0) {
+                        await new Promise<void>((resolve) => {
+                            // stop() 通过 _saveWakeUp 立即唤醒，避免最后的强制保存被睡眠吞掉
+                            this._saveWakeUp = resolve
+                            const timer = setTimeout(resolve, waitMs) as unknown as { unref?: () => void }
+                            timer.unref?.()
+                        })
+                        this._saveWakeUp = null
+                    }
+                }
             } while (this._pendingSave || this._dirty)
         } catch (error) {
             this._logger.error(`保存 proactive 状态失败：${error}`)
             this._dirty = true
         } finally {
             this._isSaving = false
+            this._saveWakeUp = null
         }
     }
 
@@ -1772,17 +1803,6 @@ export class ProactiveChatService extends Service {
                 .slice(-this.MAX_TIMESTAMPS)
         }
         return result
-    }
-
-    private async _resolveGuildIdByRoomConversationId(conversationId: string): Promise<string | null> {
-        const rooms = await this.ctx.database.get('chathub_room', { conversationId })
-        if (rooms.length === 0) return null
-
-        const roomId = rooms[0].roomId
-        const groupMembers = await this.ctx.database.get('chathub_room_group_member', { roomId })
-        if (groupMembers.length === 0) return null
-
-        return groupMembers[0].groupId ?? null
     }
 
     private _sanitizeChatMessages(

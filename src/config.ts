@@ -45,9 +45,6 @@ export interface Config {
     groupConfigs: GroupTriggerConfig[]
     privateConfigs: PrivateTriggerConfig[]
 
-    // room 同步
-    syncToAllRooms: boolean
-
     // 失败重试控制
     failureCooldownSeconds: number
     maxRetryAttempts: number
@@ -191,9 +188,6 @@ export const Config = Schema.intersect([
             .default([])
             .role('table')
             .description('应用默认配置的私聊用户列表：列表中的用户将使用默认私聊配置模板'),
-        syncToAllRooms: Schema.boolean()
-            .default(true)
-            .description('主动发言后，将对话记录同步写入该群所有用户的对话历史（仅在每用户独立 room 模式下有效）'),
         failureCooldownSeconds: Schema.number()
             .min(0).max(60 * 60 * 24)
             .default(60)
