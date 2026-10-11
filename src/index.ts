@@ -26,6 +26,9 @@ export const usage = `
 模板变量：
 - {history} {time} {date} {group_name} {user_name} {idle_minutes}
 
+### 0.3.17 版本更新内容:
+- 新增工作时间段配置 workHours（群聊/私聊每条配置独立，小时粒度）：仅允许范围内执行消息记录、判断与主动发言，如 1,3-5,8-19（支持 22-2 跨零点，留空表示全天）。时段外不影响 chatluna 正常回复；时段开始后若已满足空闲/保底条件会立即触发一次。
+
 ### 0.3.16 版本更新内容:
 - 修复 0.3.15 中主动回复仍无法发送的问题：合成会话的 userId/username/author 影子属性此前定义为可枚举，而 satori 的 MessageEncoder.send 会把会话的可枚举键逐个拷贝到新生成的发送会话上，author 在真实会话上是仅有 getter 的原型访问器，拷贝赋值即抛出 "Cannot set property author ... which has only a getter" 导致发送崩溃。现改为不可枚举，读取语义不变，键集合与真实会话对齐。
 

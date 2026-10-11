@@ -202,6 +202,7 @@ group:${guildId}
 | `historyMessageLimit` | 历史池容量，同时也是单次最多注入条数 |
 | `maxRequestImages` | 单次主动发言最多注入的图片数量 |
 | `cooldownSeconds` | 触发后冷却时间（秒） |
+| `workHours` | 工作时间段（小时，0-23）：仅在该范围内执行消息记录、判断与主动发言，如 `1,3-5,8-19`（支持 `22-2` 跨零点）；留空表示全天。时段外不影响 chatluna 正常回复 |
 
 ---
 
@@ -224,6 +225,7 @@ group:${guildId}
 | `historyMessageLimit` | 历史消息条数上限 |
 | `maxRequestImages` | 单次主动发言最多注入的图片数量 |
 | `cooldownSeconds` | 触发后冷却时间（秒） |
+| `workHours` | 工作时间段（同群聊配置说明） |
 
 ---
 
@@ -392,6 +394,9 @@ applyDefaultPrivateConfigs:
 ---
 
 ## 版本更新日志
+
+### 0.3.17
+- 新增 `workHours` 工作时间段配置（群聊/私聊每条配置独立，小时粒度，如 `1,3-5,8-19`，支持跨零点，留空全天）：时段外不执行消息记录、判断与主动发言；不影响 chatluna 正常回复；时段开始后若已满足空闲/保底条件会立即触发一次。
 
 ### 0.3.16
 - 修复 0.3.15 主动回复仍无法发送：合成会话影子属性（userId/username/author）改为不可枚举，避免 satori MessageEncoder.send 的可枚举键拷贝撞上仅有 getter 的原型访问器（"Cannot set property author"）。

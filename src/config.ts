@@ -19,6 +19,9 @@ export interface GroupTriggerConfig {
     maxRequestImages: number
     enableQuoteReplyByMessageId: boolean
     cooldownSeconds: number
+
+    // 工作时间段（小时粒度），留空表示全天允许
+    workHours: string
 }
 
 export interface PrivateTriggerConfig {
@@ -32,6 +35,9 @@ export interface PrivateTriggerConfig {
     historyMessageLimit: number
     maxRequestImages: number
     cooldownSeconds: number
+
+    // 工作时间段（小时粒度），留空表示全天允许
+    workHours: string
 }
 
 export type TriggerProfileConfig = GroupTriggerConfig | PrivateTriggerConfig
@@ -117,6 +123,9 @@ const commonSessionSchema = () => Schema.object({
     cooldownSeconds: Schema.number().min(0).max(3600)
         .default(30)
         .description('触发后冷却时间（秒）'),
+    workHours: Schema.string()
+        .default('')
+        .description('工作时间段（小时，0-23）：仅在该范围内执行消息记录、判断与主动发言，如 1,3-5,8-19（支持 22-2 跨零点）；留空表示全天'),
 })
 
 const activitySchema = () => Schema.intersect([

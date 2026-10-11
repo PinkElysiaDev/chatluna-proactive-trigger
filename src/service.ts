@@ -55,6 +55,44 @@ interface PendingRoomReset {
     attempts: number
 }
 
+/**
+ * 解析工作时间段配置（小时粒度）：如 "1,3-5,8-19" 表示每日 1 时、3-5 时、8-19 时。
+ * 支持 "22-2" 形式的跨零点区间；无效 token 静默忽略。
+ * 返回允许的小时集合；留空或无有效 token 时返回 null（表示全天允许）。
+ */
+function parseWorkHours(spec: string | undefined): Set<number> | null {
+    const text = String(spec ?? '').trim()
+    if (!text) return null
+
+    const hours = new Set<number>()
+    for (const rawToken of text.split(',')) {
+        const token = rawToken.trim()
+        if (!token) continue
+
+        const rangeMatch = /^(\d{1,2})\s*-\s*(\d{1,2})$/.exec(token)
+        if (rangeMatch) {
+            const start = Number(rangeMatch[1])
+            const end = Number(rangeMatch[2])
+            if (start > 23 || end > 23) continue
+            if (start <= end) {
+                for (let h = start; h <= end; h++) hours.add(h)
+            } else {
+                for (let h = start; h <= 23; h++) hours.add(h)
+                for (let h = 0; h <= end; h++) hours.add(h)
+            }
+            continue
+        }
+
+        const singleMatch = /^(\d{1,2})$/.exec(token)
+        if (singleMatch) {
+            const h = Number(singleMatch[1])
+            if (h <= 23) hours.add(h)
+        }
+    }
+
+    return hours.size > 0 ? hours : null
+}
+
 export class ProactiveChatService extends Service {
     private _sessions: Record<string, Session> = {}
     private _conversationStates: Record<string, ConversationState> = {}
@@ -225,6 +263,16 @@ export class ProactiveChatService extends Service {
             }
             this._debug(`[handleMessage] session not applicable: uid=${session.uid} guildId=${session.guildId} isDirect=${session.isDirect}`)
             await next(); return
+        }
+
+        // 工作时间段外：不记录消息/时间戳/计数、不做判断、不缓存 session，仅放行给后续中间件
+        // （不影响 chatluna 正常回复与其他插件）
+        if (!this._isWithinWorkHours(profile, now)) {
+            this._debug(
+                `[handleMessage] ${conversationId}: outside work hours (workHours=${profile.workHours || ''}), skipping proactive processing`
+            )
+            await next()
+            return
         }
 
         this._sessions[conversationId] = session
@@ -433,6 +481,16 @@ export class ProactiveChatService extends Service {
 
             const profile = this._getProfileByConversationId(conversationId)
             if (!profile) continue
+
+            // 工作时间段外：跳过该会话的空闲触发与保底触发
+            if (!this._isWithinWorkHours(profile, now)) {
+                this._tickLog(
+                    conversationId,
+                    'outside-work-hours',
+                    `[schedulerTick] ${conversationId}: outside work hours (workHours=${profile.workHours || ''}), skipping`
+                )
+                continue
+            }
 
             const cooldownRemaining = state.lastTriggerTime
                 ? profile.cooldownSeconds * 1000 - (now - state.lastTriggerTime)
@@ -1166,6 +1224,16 @@ export class ProactiveChatService extends Service {
         return session.isDirect
             ? `private:${session.userId}`
             : `group:${session.guildId}`
+    }
+
+    /**
+     * 是否处于工作时间段内（小时粒度，按运行环境本地时间）。
+     * 未配置 workHours 或配置无有效 token 时视为全天允许。
+     */
+    private _isWithinWorkHours(profile: TriggerProfileConfig, now: number): boolean {
+        const hours = parseWorkHours(profile.workHours)
+        if (!hours) return true
+        return hours.has(new Date(now).getHours())
     }
 
     /**
