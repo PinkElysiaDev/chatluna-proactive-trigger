@@ -1411,14 +1411,10 @@ export class ProactiveChatService extends Service {
         this._ensureMessageBucket(conversationId)
 
         const profile = this._getProfileByConversationId(conversationId) ?? null
-        const imageUrls = this._pickImageUrls(session)
-
-        if ((profile?.maxRequestImages ?? 3) <= 0 && imageUrls.length > 0) {
-            this._debug(
-                `[addChatMessage] skip image message because maxRequestImages=0, conversationId=${conversationId}, imageCount=${imageUrls.length}, proactiveEligible=false`
-            )
-            return false
-        }
+        const pickedImageUrls = this._pickImageUrls(session)
+        // 禁图时不缓存/不注入/不打图片标记，但保留文本记录与活跃度/保底统计资格；
+        // 此前整条丢弃会导致纯图片周期的保底与活跃度全部失效
+        const imageUrls = (profile?.maxRequestImages ?? 3) > 0 ? pickedImageUrls : []
 
         const images = this._cacheImages(conversationId, imageUrls)
 
@@ -1433,6 +1429,14 @@ export class ProactiveChatService extends Service {
             timestamp: session.timestamp || Date.now(),
             messageId: session.messageId ?? undefined,
             ...(images.length ? { imgs: images } : {})
+        }
+
+        // 图片被禁用且归一化后无文本（纯图消息）：无内容可记，跳过记录
+        if (pickedImageUrls.length > 0 && images.length === 0 && !msg.content.trim()) {
+            this._debug(
+                `[addChatMessage] skip pure-image message because maxRequestImages=0, conversationId=${conversationId}, imageCount=${pickedImageUrls.length}, proactiveEligible=false`
+            )
+            return false
         }
 
         const cap = Math.max(1, profile?.historyMessageLimit || this.MAX_MESSAGES)
